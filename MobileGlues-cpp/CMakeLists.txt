@@ -131,7 +131,15 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ./includes
     ./3rdparty/xxhash)
-target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC ${CMAKE_SOURCE_DIR}/include)
+# mg-3backends: vendored as a subdirectory of the MobileGL build in some
+# configurations - CMAKE_SOURCE_DIR points at the superproject there, so
+# anchor paths to this file's directory instead.
+target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# mg-3backends: the unified entry is libmobileglues.so (the dispatcher); the
+# MobileGlues core rides along as libmg_gles.so and is dlopened by the
+# dispatcher when MOBILEGL_BACKEND_TYPE=MobileGlues (Air 6.0 "GLES" backend).
+set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME "mg_gles")
 
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
     glslang::glslang
@@ -177,8 +185,8 @@ endif()
 
 if (PROFILING)
     find_package(Threads)
-    include_directories(${CMAKE_SOURCE_DIR}/3rdparty/perfetto/sdk)
-    add_library(perfetto STATIC ${CMAKE_SOURCE_DIR}/3rdparty/perfetto/sdk/perfetto.cc)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/perfetto/sdk)
+    add_library(perfetto STATIC ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/perfetto/sdk/perfetto.cc)
     target_link_libraries(${CMAKE_PROJECT_NAME} perfetto ${CMAKE_THREAD_LIBS_INIT})
     target_compile_definitions(${CMAKE_PROJECT_NAME} PUBLIC PROFILING=1)
 endif()

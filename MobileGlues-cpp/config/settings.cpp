@@ -7,6 +7,7 @@
 
 #include "settings.h"
 #include "config.h"
+#include <cstdlib> // getenv/atoi (mg-3backends FSR1 env override)
 #include "../gl/log.h"
 #include "../gl/envvars.h"
 #include "gpu_utils.h"
@@ -56,6 +57,23 @@ void init_settings() {
     int customGLVersionInt = success ? config_get_int("customGLVersion") : DEFAULT_GL_VERSION;
     FSR1_Quality_Preset fsr1Setting =
         success ? static_cast<FSR1_Quality_Preset>(config_get_int("fsr1Setting")) : FSR1_Quality_Preset::Disabled;
+    // mg-3backends: launcher-side FSR1 override. The unified plugin exposes
+    // MOBILEGL_FSR1 as a per-game selectable so FSR does not depend on a
+    // config.json the launcher may not manage; env > config.json > default.
+    // Values match FSR1_Quality_Preset: 0=Disabled 1=UltraQuality 2=Quality
+    // 3=Balanced 4=Performance. Out-of-range/absent values keep the config.
+    {
+        const char* envFsr1 = getenv("MOBILEGL_FSR1");
+        if (envFsr1 && *envFsr1) {
+            int envFsr1Val = atoi(envFsr1);
+            if (envFsr1Val >= 0 && envFsr1Val < static_cast<int>(FSR1_Quality_Preset::MaxValue)) {
+                fsr1Setting = static_cast<FSR1_Quality_Preset>(envFsr1Val);
+                LOG_V("[mg-3backends] MOBILEGL_FSR1 override applied: %d", envFsr1Val);
+            } else {
+                LOG_V("[mg-3backends] MOBILEGL_FSR1 out of range, ignored: %s", envFsr1);
+            }
+        }
+    }
     HideMGEnvLevel hideMGEnvLevel =
         success ? static_cast<HideMGEnvLevel>(config_get_int("hideMGEnvLevel")) : HideMGEnvLevel::Disabled;
 
