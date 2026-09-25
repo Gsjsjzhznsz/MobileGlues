@@ -230,6 +230,11 @@ struct texture_ctx_state_t {
     // anywhere and GL_TEXTURE0 active.
     std::array<std::array<GLuint, (int)TextureTarget::TEXTURES_COUNT>, MAX_TEXTURE_IMAGE_UNITS> driver_bindings{};
     int driver_active_unit = 0;
+    // The sampler object bound per unit, exactly as this layer last forwarded it to
+    // GLES.glBindSampler. Sampler objects are per-context state, so the shadow lives
+    // on the context record next to driver_bindings. Zero means "no sampler", which
+    // is both GL's start state and what glBindSampler(u, 0) leaves behind.
+    std::array<GLuint, MAX_TEXTURE_IMAGE_UNITS> driver_samplers{};
     // Which share group this context draws its texture objects from. Deleting an
     // object has to clear it out of every context in that group, not only the one
     // that happened to issue the glDeleteTextures.
@@ -284,6 +289,7 @@ void mg_texture_forget_context(unsigned long long ctx_id) {
 #define CurrentTextureUnitIndex (g_tc->current_unit)
 #define DriverTextureBindings (g_tc->driver_bindings)
 #define DriverActiveTextureUnit (g_tc->driver_active_unit)
+#define DriverSamplers (g_tc->driver_samplers)
 
 // The unit the emulated texture buffer is parked on. glBindTexture and
 // gl/buffer.cpp's glTexBuffer both borrow it and hand the active unit back.
@@ -349,6 +355,11 @@ void MarkTextureObjectForDeletion(unsigned texture) {
         LOG_D("Texture %u not found in BufferObjectsVec!", texture);
         return;
     }
+
+    // Out of the depth registry with it: a deleted name could be reused by the
+    // driver for a colour allocation, and a stale registry entry would then
+    // force NEAREST onto a legitimate linear colour sampler.
+    mg_unregister_depth_texture(texture);
 
     auto textureObject = BufferObjectsVec[texture];
 
@@ -483,6 +494,353 @@ TextureObject* mgGetTexObjectByID(unsigned texture) {
     }
     return BufferObjectsVec[texture];
 }
+
+// ---------------------------------------------------------------------------
+// Depth-sampling filter enforcement (MG 2.0.12, labels corrected in 2.0.14).
+// See gl/texture.h for the full rationale; the short version: MC 26.2's
+// GlSampler maps minFilter=NEAREST to GL_NEAREST_MIPMAP_LINEAR (0x2702/9986).
+// GLES 3.0 only keeps depth-family textures filter-complete for MIN_FILTER
+// NEAREST or NEAREST_MIPMAP_NEAREST, so that sampler leaves every D32F image
+// it touches filter-incomplete -- ANGLE Metal answers 0.0, reversed-z reads
+// that as "infinitely far", and the transparency composite stops occluding
+// (clouds visible through terrain). The layer forces NEAREST on the effective
+// filter wherever a sampler object would sample a depth image through a
+// non-completeness-safe MIN_FILTER, and restores the application's parameters
+// once the sampler moves off depth.
+
+namespace {
+
+std::mutex g_depth_sampler_mutex;
+
+// Driver texture names whose allocation went through a depth-family
+// internalformat. Names are not renamed across the boundary, so the key is
+// exactly what the application sees and what the driver holds.
+ska::flat_hash_map<GLuint, char> g_depth_textures;
+
+// What this layer has seen the application set on each sampler object. Created
+// samplers start from the GLES defaults: MIN = NEAREST_MIPMAP_LINEAR (0x2702
+// = 9986), MAG = NEAREST (9728), COMPARE_MODE = GL_NONE. (2.0.12 seeded this
+// with 9985 -- GL_LINEAR_MIPMAP_NEAREST per the registry -- because its gl.h
+// had the two macros swapped; the value only ever surfaced in restore
+// write-backs for samplers the application never parameterised.)
+struct mg_sampler_record_t {
+    GLint min_filter = 9986;
+    GLint mag_filter = GL_NEAREST;
+    GLint compare_mode = GL_NONE;
+};
+ska::flat_hash_map<GLuint, mg_sampler_record_t> g_sampler_records;
+
+// Samplers whose DRIVER parameters this layer has overwritten with NEAREST,
+// remembering the application's values for the restore.
+struct mg_forced_filter_t {
+    GLint min_filter;
+    GLint mag_filter;
+};
+ska::flat_hash_map<GLuint, mg_forced_filter_t> g_sampler_forced;
+
+int mg_depth_force_logged = 0;
+int mg_depth_restore_logged = 0;
+
+bool mg_ifmt_is_depth(GLenum internal_format) {
+    switch (internal_format) {
+    case GL_DEPTH_COMPONENT16:
+    case GL_DEPTH_COMPONENT24:
+    case GL_DEPTH_COMPONENT32:
+    case GL_DEPTH_COMPONENT32F:
+    case GL_DEPTH_COMPONENT:
+    case GL_DEPTH24_STENCIL8:
+    case GL_DEPTH32F_STENCIL8:
+    case GL_DEPTH_STENCIL:
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+void mg_register_depth_texture(GLuint texture) {
+    if (texture == 0) return;
+    std::lock_guard<std::mutex> lock(g_depth_sampler_mutex);
+    g_depth_textures[texture] = 1;
+}
+
+void mg_unregister_depth_texture(GLuint texture) {
+    if (texture == 0) return;
+    std::lock_guard<std::mutex> lock(g_depth_sampler_mutex);
+    g_depth_textures.erase(texture);
+    // A deleted texture cannot be sampled, so any force keyed on a unit that
+    // held it will undo itself on the next draw; nothing more to do here.
+}
+
+void mg_register_sampler(GLuint sampler) {
+    if (sampler == 0) return;
+    std::lock_guard<std::mutex> lock(g_depth_sampler_mutex);
+    g_sampler_records[sampler] = mg_sampler_record_t{};
+}
+
+void mg_forget_sampler(GLuint sampler) {
+    if (sampler == 0) return;
+    std::lock_guard<std::mutex> lock(g_depth_sampler_mutex);
+    g_sampler_records.erase(sampler);
+    g_sampler_forced.erase(sampler);
+}
+
+bool mg_unit_holds_depth_texture(int unit) {
+    if (!driver_texture_shadow_trustworthy() || unit < 0 || unit >= MAX_TEXTURE_IMAGE_UNITS) return false;
+    const GLuint tex = get_driver_texture_binding(unit, TextureTarget::TEXTURE_2D);
+    if (tex == 0) return false;
+    std::lock_guard<std::mutex> lock(g_depth_sampler_mutex);
+    return g_depth_textures.count(tex) != 0;
+}
+
+void mg_enforce_depth_sampling_nearest(void) {
+    // Two modes, same two passes.
+    //
+    // Tracked mode: contexts this layer's EGL hooks reported -- per-unit
+    // bindings read from the context's own shadow, no driver traffic.
+    //
+    // Untracked mode: contexts mg_texture_bind_context never heard about. The
+    // iOS/ANGLE host is one -- the app talks to ANGLE's libEGL directly, so
+    // g_tc sits on the shared fallback record forever, and 2.0.12's early
+    // return made the whole enforcement silently dead there: the 2.0.12
+    // device log shows the composite dump (sampler 26, MIN 9986, over all six
+    // D32F units) with not one force/restore line. The fallback record is not
+    // abandoned, though -- every hooked entry point still maintains it
+    // (glBindTexture, glActiveTexture and glBindSampler all write it, and MC
+    // 26.2 uses exactly those three for texture state; verified against the
+    // decompiled GlCommandEncoder/GlStateManager: _activeTexture + _bindTexture
+    // + GL33C.glBindSampler, no multibind, no glBindTextureUnit). What the
+    // layer's own invariant forbids is ACTING on a record "whose values belong
+    // to no context in particular". So the record is a HINT here, and every
+    // depth hint is confirmed against the driver -- glActiveTexture onto the
+    // unit, GL_TEXTURE_BINDING_2D back -- before it may force a filter. The
+    // borrows use the GLES entry points directly and put the active unit back
+    // from the driver's own answer, the same pattern
+    // setupBufferTextureUniforms already uses for its unit-15 read, so the
+    // record never learns about them and the driver nets to zero. A stale
+    // hint costs nothing but a rejected confirmation; a missed hint would
+    // need a second untracked context on the render thread rebinding depth
+    // behind our back, which MC does not do -- and a missed force self-
+    // corrects on the next draw's re-scan anyway.
+    //
+    // FSR1 precondition unchanged: with FSR1 on, the per-unit binding shadow
+    // is declared untrustworthy wholesale (its GLStateGuard leak is exactly a
+    // binding no record knows about), hints could flip a colour sampler, and
+    // a driver-side confirm cannot help because the leak is silent per frame
+    // -- so enforcement stays off. The setting is off by default.
+    const bool tracked = driver_texture_shadow_trustworthy();
+    if (!tracked && global_settings.fsr1_setting != FSR1_Quality_Preset::Disabled) return;
+
+    std::lock_guard<std::mutex> lock(g_depth_sampler_mutex);
+
+    // Cheap out before any map traffic: nothing is bound on any unit and
+    // nothing is parked in the forced state, so there is nothing to want.
+    bool any_sampler = false;
+    for (int u = 0; u < MAX_TEXTURE_IMAGE_UNITS; ++u) {
+        if (DriverSamplers[u] != 0) {
+            any_sampler = true;
+            break;
+        }
+    }
+    if (!any_sampler && g_sampler_forced.empty()) return;
+
+    static bool mg_untracked_scan_logged = false;
+    if (!tracked && !mg_untracked_scan_logged && any_sampler) {
+        mg_untracked_scan_logged = true;
+        LOG_W_FORCE("[MG] depth filter scan: context untracked (EGL bypassed this layer), "
+                    "fallback-record hints + driver confirms armed")
+    }
+
+    // Pass 1 -- desired state. A sampler must be in the forced state iff at
+    // least one of the units it is bound on holds a depth-family image. The
+    // two-pass shape exists because the same cache entry is routinely bound on
+    // a colour unit and a depth unit in the SAME draw (the transparency
+    // composite binds one NEAREST cache sampler across all twelve of its
+    // inputs): a single pass scanning units in order would force on unit 1 and
+    // restore on unit 0 and leave the draw with whichever came last.
+    ska::flat_hash_map<GLuint, bool> wants_force;
+    bool confirm_borrowed = false;
+    GLint saved_active = GL_TEXTURE0;
+    for (int u = 0; u < MAX_TEXTURE_IMAGE_UNITS; ++u) {
+        const GLuint sampler = DriverSamplers[u];
+        if (sampler == 0) continue;
+        bool& want = wants_force[sampler];
+        if (want) continue;
+        const GLuint tex = get_driver_texture_binding(u, TextureTarget::TEXTURE_2D);
+        bool holds_depth = tex != 0 && g_depth_textures.count(tex) != 0;
+        if (holds_depth && !tracked) {
+            // Hint came from the shared fallback record -- the driver decides.
+            if (!confirm_borrowed) {
+                GLES.glGetIntegerv(GL_ACTIVE_TEXTURE, &saved_active);
+                confirm_borrowed = true;
+            }
+            GLES.glActiveTexture(GL_TEXTURE0 + u);
+            GLint confirmed = 0;
+            GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &confirmed);
+            GLES.glGetError(); // keep the scan's own queries from leaving an error parked
+            holds_depth = confirmed != 0 && g_depth_textures.count((GLuint)confirmed) != 0;
+        }
+        if (holds_depth) want = true;
+    }
+    if (confirm_borrowed) GLES.glActiveTexture(saved_active);
+
+    // Pass 2 -- transitions.
+    for (const auto& entry : g_sampler_forced) {
+        const auto want = wants_force.find(entry.first);
+        if (want != wants_force.end() && want->second) continue;
+        // Unbound everywhere, or bound only over colour images now: give the
+        // application its parameters back before this draw samples anything.
+        GLES.glSamplerParameteri(entry.first, GL_TEXTURE_MIN_FILTER, entry.second.min_filter);
+        GLES.glSamplerParameteri(entry.first, GL_TEXTURE_MAG_FILTER, entry.second.mag_filter);
+        if (mg_depth_restore_logged < 8) {
+            mg_depth_restore_logged++;
+            LOG_W_FORCE("[MG] depth filter restore: sampler %u back to min %d / mag %d", entry.first,
+                        entry.second.min_filter, entry.second.mag_filter)
+        }
+        g_sampler_forced.erase(entry.first);
+    }
+    for (const auto& entry : wants_force) {
+        if (!entry.second) continue;
+        if (g_sampler_forced.count(entry.first) != 0) continue; // already forced
+        const auto record = g_sampler_records.find(entry.first);
+        if (record == g_sampler_records.end()) continue; // never seen created; leave it alone
+        if (record->second.compare_mode != GL_NONE) continue; // hardware PCF stays untouched
+        if (record->second.min_filter == GL_NEAREST && record->second.mag_filter == GL_NEAREST) continue;
+        g_sampler_forced[entry.first] = mg_forced_filter_t{record->second.min_filter, record->second.mag_filter};
+        GLES.glSamplerParameteri(entry.first, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        GLES.glSamplerParameteri(entry.first, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        if (mg_depth_force_logged < 8) {
+            mg_depth_force_logged++;
+            LOG_W_FORCE("[MG] depth filter force: sampler %u min %d / mag %d -> NEAREST (depth image sampled)",
+                        entry.first, record->second.min_filter, record->second.mag_filter)
+        }
+    }
+}
+
+// The sampler-object entry points this layer has to see. They used to be raw
+// native passthroughs, which was correct as long as sampler parameters were
+// none of the layer's business -- the depth-filter enforcement changed that:
+// it needs to know what each sampler was created with, where each one is
+// bound, and when the application rewrites one, so a forced NEAREST never
+// survives longer than the depth image it protects.
+
+extern "C" {
+GLAPI GLAPIENTRY void glGenSamplers(GLsizei count, GLuint* samplers);
+GLAPI GLAPIENTRY void glDeleteSamplers(GLsizei count, const GLuint* samplers);
+GLAPI GLAPIENTRY void glBindSampler(GLuint unit, GLuint sampler);
+GLAPI GLAPIENTRY void glSamplerParameteri(GLuint sampler, GLenum pname, GLint param);
+GLAPI GLAPIENTRY void glSamplerParameterf(GLuint sampler, GLenum pname, GLfloat param);
+}
+
+void glGenSamplers(GLsizei count, GLuint* samplers) {
+    LOG()
+    GLES.glGenSamplers(count, samplers);
+    CHECK_GL_ERROR
+    for (GLsizei i = 0; i < count; ++i) {
+        if (samplers[i] != 0) mg_register_sampler(samplers[i]);
+    }
+}
+
+void glDeleteSamplers(GLsizei count, const GLuint* samplers) {
+    LOG()
+    GLES.glDeleteSamplers(count, samplers);
+    CHECK_GL_ERROR
+    for (GLsizei i = 0; i < count; ++i) {
+        if (samplers[i] == 0) continue;
+        mg_forget_sampler(samplers[i]);
+        // Sweep the name out of every context's per-unit shadow, the same way
+        // a deleted texture is swept from the per-unit binding shadows.
+        std::lock_guard<std::mutex> lock(g_tex_mutex);
+        auto sweep = [&](texture_ctx_state_t& ctx) {
+            for (auto& s : ctx.driver_samplers) {
+                if (s == samplers[i]) s = 0;
+            }
+        };
+        sweep(*g_tc);
+        for (const auto& entry : g_tex_ctxs) {
+            if (entry.second.get() != g_tc) sweep(*entry.second);
+        }
+        sweep(g_tex_ctx_default);
+    }
+}
+
+void glBindSampler(GLuint unit, GLuint sampler) {
+    LOG()
+    if (unit < (GLuint)MAX_TEXTURE_IMAGE_UNITS) {
+        DriverSamplers[unit] = sampler;
+    }
+    GLES.glBindSampler(unit, sampler);
+    CHECK_GL_ERROR
+}
+
+void glSamplerParameteri(GLuint sampler, GLenum pname, GLint param) {
+    LOG()
+    {
+        std::lock_guard<std::mutex> lock(g_depth_sampler_mutex);
+        // The application is restating this sampler's parameters, so any force
+        // currently parked on it is stale by definition: drop it and record the
+        // incoming value as the truth the next restore must give back.
+        g_sampler_forced.erase(sampler);
+        auto record = g_sampler_records.find(sampler);
+        if (record != g_sampler_records.end()) {
+            switch (pname) {
+            case GL_TEXTURE_MIN_FILTER: record->second.min_filter = param; break;
+            case GL_TEXTURE_MAG_FILTER: record->second.mag_filter = param; break;
+            case GL_TEXTURE_COMPARE_MODE: record->second.compare_mode = param; break;
+            default: break;
+            }
+        }
+    }
+    GLES.glSamplerParameteri(sampler, pname, param);
+    CHECK_GL_ERROR
+}
+
+void glSamplerParameterf(GLuint sampler, GLenum pname, GLfloat param) {
+    LOG()
+    {
+        std::lock_guard<std::mutex> lock(g_depth_sampler_mutex);
+        g_sampler_forced.erase(sampler);
+        auto record = g_sampler_records.find(sampler);
+        if (record != g_sampler_records.end()) {
+            switch (pname) {
+            case GL_TEXTURE_MIN_FILTER: record->second.min_filter = (GLint)param; break;
+            case GL_TEXTURE_MAG_FILTER: record->second.mag_filter = (GLint)param; break;
+            case GL_TEXTURE_COMPARE_MODE: record->second.compare_mode = (GLint)param; break;
+            default: break;
+            }
+        }
+    }
+    GLES.glSamplerParameterf(sampler, pname, param);
+    CHECK_GL_ERROR
+}
+
+// The NATIVE_FUNCTION_HEAD macro these wrappers replace also emitted an
+// `##ARB` alias for each name on non-Apple hosts; keep the exported surface
+// identical so nothing that resolved the ARB spelling loses its symbol.
+#ifndef __APPLE__
+extern "C" {
+GLAPI GLAPIENTRY void glGenSamplersARB(GLsizei count, GLuint* samplers) __attribute__((alias("glGenSamplers")));
+GLAPI GLAPIENTRY void glDeleteSamplersARB(GLsizei count, const GLuint* samplers) __attribute__((alias("glDeleteSamplers")));
+GLAPI GLAPIENTRY void glBindSamplerARB(GLuint unit, GLuint sampler) __attribute__((alias("glBindSampler")));
+GLAPI GLAPIENTRY void glSamplerParameteriARB(GLuint sampler, GLenum pname, GLint param)
+    __attribute__((alias("glSamplerParameteri")));
+GLAPI GLAPIENTRY void glSamplerParameterfARB(GLuint sampler, GLenum pname, GLfloat param)
+    __attribute__((alias("glSamplerParameterf")));
+}
+#else
+extern "C" {
+GLAPI GLAPIENTRY void glGenSamplersARB(GLsizei count, GLuint* samplers) { glGenSamplers(count, samplers); }
+GLAPI GLAPIENTRY void glDeleteSamplersARB(GLsizei count, const GLuint* samplers) { glDeleteSamplers(count, samplers); }
+GLAPI GLAPIENTRY void glBindSamplerARB(GLuint unit, GLuint sampler) { glBindSampler(unit, sampler); }
+GLAPI GLAPIENTRY void glSamplerParameteriARB(GLuint sampler, GLenum pname, GLint param) {
+    glSamplerParameteri(sampler, pname, param);
+}
+GLAPI GLAPIENTRY void glSamplerParameterfARB(GLuint sampler, GLenum pname, GLfloat param) {
+    glSamplerParameterf(sampler, pname, param);
+}
+}
+#endif
 
 // Inline mapping for various internal formats to format and type.
 //
@@ -824,6 +1182,19 @@ void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
         return;
     }
 
+    // Depth images do not survive a LINEAR sample on GLES (see gl/texture.h):
+    // when the application points MIN/MAG filtering at a depth texture with its
+    // own parameters, the driver is given NEAREST instead. The application-side
+    // value is not recorded -- the texture object shadow keeps no filter fields
+    // -- but MC 26.2 never filters a depth target this way in the first place;
+    // this arm exists so a mod that does cannot reopen the reversed-z hole.
+    if ((pname == GL_TEXTURE_MIN_FILTER || pname == GL_TEXTURE_MAG_FILTER) && (GLint)param != GL_NEAREST) {
+        const TextureObject* bound = mgGetTexObjectByTarget(target);
+        if (bound && bound->texture != 0 && mg_ifmt_is_depth(bound->internal_format)) {
+            param = (GLfloat)GL_NEAREST;
+        }
+    }
+
     GLES.glTexParameterf(target, pname, param);
     CHECK_GL_ERROR
 }
@@ -946,6 +1317,55 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
 
     GLES.glTexImage2D(target, level, internalFormat, width, height, border, format, type, fix.pixels);
 
+    // MG 2.0.12: a successful depth-family allocation joins the depth registry
+    // (see gl/texture.h) and gets its own MIN/MAG forced to NEAREST on the
+    // driver side. The texture is still bound on the active unit here, so the
+    // two parameter calls land on it directly. This covers sampling through
+    // texture parameters alone (no sampler object bound); sampler objects are
+    // handled per draw in mg_enforce_depth_sampling_nearest.
+    {
+        const TextureObject* shadow_tex = mgGetTexObjectByTarget(target);
+        if (shadow_tex && shadow_tex->texture != 0 && mg_ifmt_is_depth((GLenum)internalFormat)) {
+            mg_register_depth_texture(shadow_tex->texture);
+            GLES.glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            GLES.glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
+    }
+
+    // MC 26.x runs its whole transparency pipeline (clouds/weather/particles
+    // occlusion) on float depth textures. The 2.0.9 diagnostic read zeros for
+    // the first D32F allocation on device, which conflated three different
+    // things: GL_TEXTURE_INTERNAL_FORMAT is not an ES 3.0 pname (ANGLE rejects
+    // it, Mesa tolerates it), the query reads whatever the CURRENT unit holds,
+    // and a rejected allocation leaves an empty level. Record every depth
+    // allocation with all three separated: the texture this layer believes is
+    // bound, what the DRIVER says is bound on the active unit, whether the
+    // upload raised an error, and the depth-bit count of what the driver
+    // actually has on that binding.
+    static int mg_depth_alloc_logged = 0;
+    if (mg_depth_alloc_logged < 12 &&
+        (internalFormat == GL_DEPTH_COMPONENT16 || internalFormat == GL_DEPTH_COMPONENT24 ||
+         internalFormat == GL_DEPTH_COMPONENT32 || internalFormat == GL_DEPTH_COMPONENT32F ||
+         internalFormat == GL_DEPTH_COMPONENT || internalFormat == GL_DEPTH24_STENCIL8 ||
+         internalFormat == GL_DEPTH32F_STENCIL8 || internalFormat == GL_DEPTH_STENCIL)) {
+        mg_depth_alloc_logged++;
+        GLint err = GLES.glGetError();
+        GLint drv_bound = 0;
+        GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &drv_bound);
+        GLint depth_bits = -1;
+        if (drv_bound != 0) {
+            GLES.glGetTexLevelParameteriv(GL_TEXTURE_2D, level, GL_TEXTURE_DEPTH_SIZE, &depth_bits);
+            GLES.glGetError(); // clear the query error if the level is not allocated
+        }
+        const TextureObject* shadow_tex = mgGetTexObjectByTarget(target);
+        LOG_W_FORCE("[MG] depth alloc #%d: %s %dx%d, shadow tex %u, driver-bound tex %d, upload err 0x%x, depth bits %d",
+                    mg_depth_alloc_logged, glEnumToString(internalFormat), width, height,
+                    shadow_tex ? shadow_tex->texture : 0, drv_bound, err, depth_bits)
+        if (err != GL_NO_ERROR) {
+            LOG_W_FORCE("[MG] note: depth allocation raised an error -- the level is empty and every FBO using it reads garbage")
+        }
+    }
+
     CHECK_GL_ERROR
 }
 
@@ -1002,6 +1422,15 @@ void glTexImage3D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
     tex->swizzle_param[2] = GL_BLUE;
     tex->swizzle_param[3] = GL_ALPHA;
 
+    // Same depth-registry note as glTexImage2D above; 3D depth targets are not
+    // a thing GLES renders into, but the registry costs nothing and being
+    // complete beats being clever.
+    if (tex->texture != 0 && mg_ifmt_is_depth((GLenum)internalFormat)) {
+        mg_register_depth_texture(tex->texture);
+        GLES.glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        GLES.glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+
     CHECK_GL_ERROR
 }
 
@@ -1052,6 +1481,13 @@ void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalFormat, GLsize
     tex->swizzle_param[2] = GL_BLUE;
     tex->swizzle_param[3] = GL_ALPHA;
 
+    // Same depth-registry note as glTexImage2D above.
+    if (tex->texture != 0 && mg_ifmt_is_depth((GLenum)internalFormat)) {
+        mg_register_depth_texture(tex->texture);
+        GLES.glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        GLES.glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+
     GLenum ERR = GLES.glGetError();
     if (ERR != GL_NO_ERROR) LOG_E("glTexStorage2D ERROR: %d", ERR)
 }
@@ -1077,6 +1513,13 @@ void glTexStorage3D(GLenum target, GLsizei levels, GLenum internalFormat, GLsize
     tex->swizzle_param[1] = GL_GREEN;
     tex->swizzle_param[2] = GL_BLUE;
     tex->swizzle_param[3] = GL_ALPHA;
+
+    // Same depth-registry note as glTexImage2D above.
+    if (tex->texture != 0 && mg_ifmt_is_depth((GLenum)internalFormat)) {
+        mg_register_depth_texture(tex->texture);
+        GLES.glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        GLES.glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
 
     CHECK_GL_ERROR
 }
@@ -1766,6 +2209,14 @@ void glTexParameteri(GLenum target, GLenum pname, GLint param) {
     if (pname == GL_TEXTURE_LOD_BIAS_QCOM && !g_gles_caps.GL_QCOM_texture_lod_bias) {
         LOG_D("Does not support GL_QCOM_texture_lod_bias, skipped!")
         return;
+    }
+
+    // Same depth-image filter guard as glTexParameterf above.
+    if ((pname == GL_TEXTURE_MIN_FILTER || pname == GL_TEXTURE_MAG_FILTER) && param != GL_NEAREST) {
+        const TextureObject* bound = mgGetTexObjectByTarget(target);
+        if (bound && bound->texture != 0 && mg_ifmt_is_depth(bound->internal_format)) {
+            param = GL_NEAREST;
+        }
     }
 
     GLES.glTexParameteri(target, pname, param);

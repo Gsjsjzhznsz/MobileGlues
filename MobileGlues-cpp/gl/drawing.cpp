@@ -12,6 +12,8 @@
 #include "mg.h"
 #include "texture.h"
 #include "../egl/context.h"
+#include <cstring>
+#include "log.h"
 
 #define DEBUG 0
 
@@ -20,6 +22,7 @@ GLuint bufSampelerLoc;
 std::string bufSampelerName;
 
 extern UnorderedMap<GLuint, bool> program_map_is_sampler_buffer_emulated;
+extern UnorderedMap<GLuint, std::vector<std::string>> program_map_sampler_buffer_names;
 
 UnorderedMap<GLuint, SamplerInfo> g_samplerCacheForSamplerBuffer;
 
@@ -102,20 +105,34 @@ const resolved_program_t& resolve_program(GLuint program) {
         if (built.locWidth == -1) {
             LOG_W("u_BufferTexWidth uniform not found in program %d", program);
         } else {
-            GLint numUniforms = 0;
-            GLES.glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &numUniforms);
-            LOG_D("Program %d has %d active uniforms", program, numUniforms);
-
-            for (GLint i = 0; i < numUniforms; ++i) {
-                const GLsizei bufSize = 256;
-                GLchar name[bufSize];
-                GLsizei length = 0;
-                GLint size = 0;
-                GLenum type = 0;
-                GLES.glGetActiveUniform(program, i, bufSize, &length, &size, &type, name);
-
-                if (type == GL_SAMPLER_2D || type == GL_INT_SAMPLER_2D) {
-                    built.samplers.push_back(GLES.glGetUniformLocation(program, name));
+            // Resolve locations by NAME, from the list of samplers this program's
+            // shaders really converted from samplerBuffer. The old scan collected
+            // every active GL_SAMPLER_2D in the program and repointed them ALL at
+            // the emulation unit -- which, for a program mixing a buffer texture
+            // with ordinary 2D samplers (Sodium 0.9's chunk program: u_LightTex
+            // and u_BlockTex alongside u_SectionTimeInfo), hijacked the atlas and
+            // light map onto the section-info texture and discarded every chunk
+            // fragment out of existence. Ordinary samplers must keep whatever
+            // unit the application assigned them.
+            const auto names = program_map_sampler_buffer_names.find(program);
+            if (names != program_map_sampler_buffer_names.end() && !names->second.empty()) {
+                for (const auto& name : names->second) {
+                    GLint loc = GLES.glGetUniformLocation(program, name.c_str());
+                    if (loc >= 0) built.samplers.push_back(loc);
+                    // Arrays: uniform isamplerBuffer foo[N] surfaces as location
+                    // of foo or foo[0]; every element reads the emulation unit,
+                    // so repoint each. Bounded: GLES guarantees at least 16
+                    // fragments of nothing -- 8 elements is far past anything a
+                    // buffer-texture shader declares, and the loop stops at the
+                    // first missing element.
+                    for (int element = 0; element < 8; ++element) {
+                        char elem[192];
+                        snprintf(elem, sizeof(elem), "%s[%d]", name.c_str(), element);
+                        GLint eloc = GLES.glGetUniformLocation(program, elem);
+                        if (eloc < 0) break;
+                        if (element == 0 && loc >= 0) continue; // already pushed via base name
+                        built.samplers.push_back(eloc);
+                    }
                 }
             }
         }
@@ -193,12 +210,195 @@ void setupBufferTextureUniforms(GLuint program) {
     GLES.glUniform1i(info.locHeight, texObject->height);
 }
 
-void prepareForDraw() {
+void prepareForDraw(int api);
+
+void prepareForDraw() { prepareForDraw(0); }
+
+void prepareForDraw(int api) {
     LOG_D("prepareForDraw...")
     if (hardware->emulate_texture_buffer) {
         setupBufferTextureUniforms(gl_state->current_program);
     }
+    // Depth-sampling program dump.
+    //
+    // The composite that per-pixel-sorts MC 26.2's transparency layers (water,
+    // clouds, particles, weather) reads six depth textures through sampler2D
+    // uniforms. The dump grades, for each of the first four depth-sampling
+    // programs, once per program:
+    //   - every sampler2D's unit, the texture and sampler object bound there,
+    //     their filtering, and the registry's internal format for the texture;
+    //   - the current draw fbo and what is attached to it.
+    // Reading depth through a sampler that leaves the texture filter-
+    // incomplete is the classic silent killer on strict ES drivers: GLES 3.0
+    // only keeps depth textures complete for MIN_FILTER NEAREST or
+    // NEAREST_MIPMAP_NEAREST, an incomplete texture reads black, which in
+    // reversed-z is "infinitely far" and un-occludes everything, and it is
+    // invisible to every check that only looks at textures and blits.
+    // 2.0.11's device log caught it red-handed: the composite's samplers
+    // carry MIN = GL_NEAREST_MIPMAP_LINEAR (9986), which Mojang's GlSampler
+    // emits for minFilter=NEAREST. The enforcement below rewrites exactly
+    // that combination to NEAREST for the draw.
+    static ska::flat_hash_map<GLuint, bool>* mg_dumped_programs = nullptr;
+    static int mg_dumped_programs_count = 0;
+    GLuint program = gl_state->current_program;
+    if (program != 0 && mg_dumped_programs_count < 4 &&
+        (!mg_dumped_programs || !(*mg_dumped_programs)[program])) {
+        GLint active_uniforms = 0;
+        GLES.glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &active_uniforms);
+        if (active_uniforms > 0 && active_uniforms < 64) {
+            char name_buf[128];
+            int sampler_count = 0;
+            bool has_depth_sampler = false;
+            for (GLint i = 0; i < active_uniforms; ++i) {
+                GLsizei len = 0;
+                GLenum type = 0;
+                GLint size = 0;
+                GLES.glGetActiveUniform(program, (GLuint)i, sizeof(name_buf), &len, &size, &type, name_buf);
+                if (type == GL_SAMPLER_2D) {
+                    sampler_count++;
+                    if (len > 0 && strstr(name_buf, "Depth") != nullptr) has_depth_sampler = true;
+                }
+            }
+            if (has_depth_sampler && sampler_count >= 2) {
+                if (!mg_dumped_programs) mg_dumped_programs = new ska::flat_hash_map<GLuint, bool>();
+                (*mg_dumped_programs)[program] = true;
+                mg_dumped_programs_count++;
+                GLint draw_fbo = 0;
+                GLES.glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
+                LOG_W_FORCE("[MG] depth-sampling program %u (dump #%d): %d sampler2D uniforms, draw fbo %d", program,
+                            mg_dumped_programs_count, sampler_count, draw_fbo)
+                for (GLint i = 0; i < active_uniforms; ++i) {
+                    GLsizei len = 0;
+                    GLenum type = 0;
+                    GLint size = 0;
+                    GLES.glGetActiveUniform(program, (GLuint)i, sizeof(name_buf), &len, &size, &type, name_buf);
+                    if (type != GL_SAMPLER_2D) continue;
+                    GLint loc = GLES.glGetUniformLocation(program, name_buf);
+                    GLint unit = -1;
+                    GLES.glGetUniformiv(program, loc, &unit);
+                    GLuint shadow_tex = 0, drv_tex = 0, drv_sampler = 0;
+                    GLint tex_minf = -1, tex_magf = -1, samp_minf = -1, samp_magf = -1;
+                    GLenum tex_fmt = 0;
+                    if (unit >= 0 && unit < (GLint)mg_max_texture_units()) {
+                        mg_driver_texture_binding_at_unit((GLuint)unit, GL_TEXTURE_2D, &shadow_tex);
+                        int prev_unit = mg_driver_active_texture_unit();
+                        GLES.glActiveTexture(GL_TEXTURE0 + unit);
+                        GLint q = 0;
+                        GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &q);
+                        drv_tex = (GLuint)q;
+                        q = 0;
+                        GLES.glGetIntegerv(GL_SAMPLER_BINDING, &q);
+                        drv_sampler = (GLuint)q;
+                        if (drv_tex != 0) {
+                            GLES.glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &tex_minf);
+                            GLES.glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &tex_magf);
+                            const TextureObject* to = mgGetTexObjectByID(drv_tex);
+                            if (to) tex_fmt = to->internal_format;
+                            GLES.glGetError(); // clear a rejected-parameter error, if any
+                        }
+                        if (drv_sampler != 0) {
+                            GLES.glGetSamplerParameteriv(drv_sampler, GL_TEXTURE_MIN_FILTER, &samp_minf);
+                            GLES.glGetSamplerParameteriv(drv_sampler, GL_TEXTURE_MAG_FILTER, &samp_magf);
+                            GLES.glGetError(); // same
+                        }
+                        GLES.glActiveTexture(GL_TEXTURE0 + prev_unit);
+                    }
+                    auto filter_name = [](GLint f) -> const char* {
+                        switch (f) {
+                        // 2.0.11 printed these with GL_NEAREST/GL_LINEAR swapped,
+                        // which turned the 2.0.11 log's "LINEAR" rows into
+                        // NEAREST and hid the real mechanism for a round. The
+                        // 2.0.12 table then carried the same swap 2.0.12's own
+                        // gl.h had picked up for 9985/9986 (registry order:
+                        // 0x2701 = LINEAR_MIPMAP_NEAREST, 0x2702 =
+                        // NEAREST_MIPMAP_LINEAR) -- fixed here against the
+                        // Khronos registry: Mojang's GlSampler maps
+                        // minFilter=NEAREST to 9986 = GL_NEAREST_MIPMAP_LINEAR.
+                        case 9728: return "NEAREST";
+                        case 9729: return "LINEAR";
+                        case 9984: return "NEAREST_MIPMAP_NEAREST";
+                        case 9985: return "LINEAR_MIPMAP_NEAREST";
+                        case 9986: return "NEAREST_MIPMAP_LINEAR";
+                        case 9987: return "LINEAR_MIPMAP_LINEAR";
+                        case -1: return "(n/a)";
+                        default: return "other";
+                        }
+                    };
+                    LOG_W_FORCE("[MG]   %-24s -> unit %2d, tex %u/%u, fmt %s, tex filter %s/%s, sampler %u filter %s/%s",
+                                name_buf, unit, shadow_tex, drv_tex, tex_fmt ? glEnumToString(tex_fmt) : "(none)",
+                                filter_name(tex_minf), filter_name(tex_magf), drv_sampler,
+                                filter_name(samp_minf), filter_name(samp_magf))
+                }
+                // What the program is being rendered into. GL_FRAMEBUFFER_ATTACHMENT_
+                // OBJECT_TYPE/NAME are core ES 3.0 and cannot be refused.
+                GLint draw_fbo2 = 0;
+                GLES.glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo2);
+                for (int which = 0; which < 2; ++which) {
+                    GLenum attachment = which == 0 ? GL_COLOR_ATTACHMENT0 : GL_DEPTH_ATTACHMENT;
+                    GLint atype = 0, aname = 0;
+                    GLES.glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachment,
+                                                               GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &atype);
+                    GLES.glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, attachment,
+                                                               GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &aname);
+                    GLES.glGetError(); // an empty attachment refuses the NAME query; that is fine
+                    LOG_W_FORCE("[MG]   draw fbo %d %s: type 0x%x, object %u", draw_fbo2,
+                                which == 0 ? "color0" : "depth ", atype, (unsigned)aname)
+                }
+            }
+        }
+    }
+
+    // The fix itself, every draw: wherever a sampler object would linearly
+    // sample a depth-family image, its driver-side MIN/MAG are rewritten to
+    // NEAREST for as long as that pairing lasts (see gl/texture.h). Runs after
+    // the dump so the first sight of a broken composite still logs the
+    // application's raw state, then the force it received.
+    mg_enforce_depth_sampling_nearest();
 }
+
+
+// The plain-glDrawArrays wrapper from 2.0.9 stays: MC 26.2's drawFromBuffers no
+// longer issues plain glDrawArrays itself, but LWJGL's GL11.glDrawArrays is the
+// legacy path older mods and GlStateManager compat code can still take, and the
+// TBO sampler rewiring must cover it either way.
+void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+    LOG()
+    LOG_D("glDrawArrays, mode: %d, first: %d, count: %d", mode, first, count)
+    prepareForDraw(1);
+    GLES.glDrawArrays(mode, first, count);
+    CHECK_GL_ERROR
+}
+
+// MC 26.2's GlCommandEncoder.drawFromBuffers (disassembled from the shipped
+// client.jar) routes every non-indexed draw -- the transparency composite's
+// full-screen triangle included -- through glDrawArraysInstanced, and its
+// ARBBaseInstance sibling when baseinstance != 0. This wrapper used to be a
+// native passthrough, which meant the one draw the depth-sort pipeline lives
+// by never reached prepareForDraw: no TBO sampler rewiring for any instanced
+// draw, and no way for a diagnostic to see the composite's inputs.
+void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
+    LOG()
+    LOG_D("glDrawArraysInstanced, mode: %d, first: %d, count: %d, instancecount: %d", mode, first, count,
+          instancecount)
+    prepareForDraw(3);
+    GLES.glDrawArraysInstanced(mode, first, count, instancecount);
+    CHECK_GL_ERROR
+}
+
+// The NATIVE_FUNCTION_HEAD macro this replaces also emitted an `##ARB` alias;
+// keep the alias alive so anything resolving the ARB spelling still binds here.
+#ifndef __APPLE__
+extern "C" {
+GLAPI GLAPIENTRY void glDrawArraysInstancedARB(GLenum mode, GLint first, GLsizei count, GLsizei instancecount)
+    __attribute__((alias("glDrawArraysInstanced")));
+}
+#else
+extern "C" {
+GLAPI GLAPIENTRY void glDrawArraysInstancedARB(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
+    glDrawArraysInstanced(mode, first, count, instancecount);
+}
+}
+#endif
 
 void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei primcount) {
     LOG()
@@ -216,7 +416,7 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void
 void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
     LOG()
     LOG_D("glDrawElements, mode: %d, count: %d, type: %d, indices: %p", mode, count, type, indices)
-    prepareForDraw();
+    prepareForDraw(2);
     if (mg_restart_needs_rewrite(type) && mg_draw_elements_restart(mode, count, type, indices, 0, -1)) return;
     const bool restart_fixed = mg_restart_needs_driver_fixed(type);
     if (restart_fixed) GLES.glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
@@ -524,7 +724,7 @@ void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, 
         DR_WARN_ONCE("glDrawArraysInstancedBaseInstance: baseinstance %u ignored, GLES has no base instance",
                      baseinstance);
     }
-    prepareForDraw();
+    prepareForDraw(4);
     GLES.glDrawArraysInstanced(mode, first, count, instancecount);
     CHECK_GL_ERROR
 }

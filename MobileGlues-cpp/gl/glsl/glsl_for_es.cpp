@@ -12,6 +12,7 @@
 #include <spirv_cross/spirv_cross_c.h>
 #include <iostream>
 #include <fstream>
+#include <cstring>
 #include "../log.h"
 #include "glslang/SPIRV/GlslangToSpv.h"
 #include <string>
@@ -21,6 +22,18 @@
 #include <sstream>
 #include "cache.h"
 #include "../../version.h"
+
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <mutex>
+// NB: <sys/ucontext.h>, NOT <ucontext.h> -- the latter errors out on the
+// iOS SDK without _XOPEN_SOURCE. sys/ucontext.h defines ucontext_t with
+// uc_mcontext (mcontext_t, a pointer to _STRUCT_MCONTEXT64) and uc_mcsize.
+#include <sys/ucontext.h>
+#include <dlfcn.h>
+#endif
 
 #define DEBUG 0
 
@@ -352,10 +365,19 @@ std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_vers
     sha256_string += "\n//" + std::to_string(MAJOR) + "." + std::to_string(MINOR) + "." + std::to_string(REVISION) +
                      "|" + std::to_string(essl_version);
     const char* cachedESSL = Cache::get_instance().get(sha256_string.c_str());
-    if (cachedESSL) {
+    // SPIRV-Cross output always starts with "#version". A cached entry that
+    // does not is corrupt — e.g. written by a build whose glslang/SPIRV-Cross
+    // were not at the pinned commits, which on iOS surfaced as ANGLE failing
+    // every shader with "ERROR: 1:1: '' : syntax error". Fall through to a
+    // fresh conversion instead; the put() below then overwrites the bad
+    // entry, so the cache self-heals on the first miss.
+    if (cachedESSL && strncmp(cachedESSL, "#version", 8) == 0) {
         LOG_D("GLSL Hit Cache:\n%s\n-->\n%s", glsl_code, cachedESSL)
         return_code = 0;
         return (char*)cachedESSL;
+    }
+    if (cachedESSL) {
+        LOG_W_FORCE("[MG] Cached ESSL is corrupt (head='%.64s') — ignoring cache and re-translating.", cachedESSL)
     }
 
     return_code = -1;
@@ -490,20 +512,176 @@ static size_t find_insertion_point(const std::string& glsl) {
     return insertion_point;
 }
 
-void process_sampler_buffer(std::string& source) { // a simplized version, should be rewritten in the future
-    if (source.find("isamplerBuffer") == std::string::npos) {
+// ----------------------------------------------------------------------------
+// Buffer-texture (samplerBuffer) emulation for ES 3.0 backends.
+//
+// The previous implementation rewrote texelFetch argument lists with
+//     std::regex(R"(texelFetch\s*\(\s*(\w+)\s*,\s*([^)]+?)\s*\))")
+// whose [^)]+? stops at the FIRST ')' -- so any coordinate expression with a
+// nested call was shredded mid-way. Sodium 0.9.x's
+//     texelFetch(u_SectionTimeInfo, int((u_RegionID * 256u) + uint(chunkId)))
+// came out as
+//     ivec2((int((u_RegionID * 256u) % u_BufferTexWidth, ...)
+// which (a) makes 'temp uint % uniform int' out of u_RegionID * 256u -- a
+// guaranteed glslang parse error at desktop 330 ("0:%d '%' : wrong operand
+// types", plus the bogus "missing #endif" cascade) and (b) unbalances the
+// parens for everything after it. Every Sodium terrain pipeline compiles that
+// one vertex shader, so the whole world went unrendered. The scanner below
+// tracks real paren depth instead; a text-level regex cannot do this job.
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// ')' matching the '(' at 'open'; npos when unbalanced (callers leave the
+// source untouched instead of corrupting it).
+size_t find_matching_paren(const std::string& source, size_t open) {
+    if (open >= source.size() || source[open] != '(') return std::string::npos;
+    int depth = 0;
+    for (size_t i = open; i < source.size(); ++i) {
+        if (source[i] == '(') {
+            depth++;
+        } else if (source[i] == ')') {
+            if (--depth == 0) return i;
+        }
+    }
+    return std::string::npos;
+}
+
+size_t skip_ws(const std::string& s, size_t p) {
+    while (p < s.size() && std::isspace((unsigned char)s[p])) ++p;
+    return p;
+}
+
+std::string trim_ws(const std::string& s) {
+    size_t b = 0, e = s.size();
+    while (b < e && std::isspace((unsigned char)s[b])) ++b;
+    while (e > b && std::isspace((unsigned char)s[e - 1])) --e;
+    return s.substr(b, e - b);
+}
+
+// Split [begin, end) on top-level commas (paren depth 0 relative to begin).
+std::vector<std::string> split_top_level_args(const std::string& source, size_t begin, size_t end) {
+    std::vector<std::string> args;
+    int depth = 0;
+    size_t start = begin;
+    for (size_t i = begin; i < end; ++i) {
+        char c = source[i];
+        if (c == '(') {
+            depth++;
+        } else if (c == ')') {
+            depth--;
+        } else if (c == ',' && depth == 0) {
+            args.push_back(source.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    args.push_back(source.substr(start, end - start));
+    return args;
+}
+
+// "ivec2 ( EXPR )" with EXPR containing no top-level comma (i.e. a linear
+// index, not a 2D coordinate) -> true, EXPR in 'inner'.
+bool parse_single_component_ivec2(const std::string& arg, std::string& inner) {
+    const std::string head = "ivec2";
+    if (arg.compare(0, head.size(), head) != 0) return false;
+    size_t p = skip_ws(arg, head.size());
+    if (p >= arg.size() || arg[p] != '(') return false;
+    size_t close = find_matching_paren(arg, p);
+    if (close == std::string::npos) return false;
+    if (trim_ws(arg.substr(close + 1)).size() != 0) return false;
+    size_t begin = p + 1, end = close;
+    for (size_t i = begin; i < end; ++i) {
+        if (arg[i] == '(') {
+            // only track depth; commas inside nested parens are not top-level
+        } else if (arg[i] == ',') {
+            // any top-level comma means 2+ components -> a real 2D coordinate
+            return false;
+        }
+    }
+    inner = trim_ws(arg.substr(begin, end - begin));
+    return !inner.empty();
+}
+
+} // namespace
+
+void process_sampler_buffer(std::string& source) {
+    // The check matches isamplerBuffer/usamplerBuffer too (substring), and the
+    // swap below keeps those single-letter prefixes intact.
+    if (source.find("samplerBuffer") == std::string::npos) {
         return;
     }
 
+    // samplerBuffer / isamplerBuffer / usamplerBuffer -> (i/u)sampler2D
     size_t pos = 0;
-    while ((pos = source.find("isamplerBuffer", pos)) != std::string::npos) {
-        source.replace(pos, 14, "isampler2D");
-        pos += 11;
+    while ((pos = source.find("samplerBuffer", pos)) != std::string::npos) {
+        source.replace(pos, 13, "sampler2D");
+        pos += 9;
     }
 
-    std::regex pattern(R"(texelFetch\s*\(\s*(\w+)\s*,\s*([^)]+?)\s*\))");
-    source = std::regex_replace(source, pattern,
-                                "texelFetch($1, ivec2(($2) % u_BufferTexWidth, ($2) / u_BufferTexWidth), 0)");
+    // texelFetch rewriting with paren-aware argument parsing:
+    //   texelFetch(SAMP, COORD)                     (buffer-texture form)
+    //     -> texelFetch(SAMP, ivec2((int(COORD)) % u_BufferTexWidth,
+    //                               (int(COORD)) / u_BufferTexWidth), 0)
+    //   texelFetch(SAMP, ivec2(INDEX), 0)           (pre-flattened linear form)
+    //     -> texelFetch(SAMP, bufferCoords(int(INDEX)), 0)
+    // COORD/INDEX go through int(...): the coordinate of a buffer fetch is an
+    // int in valid GLSL, but drivers accept uint expressions there and the
+    // emulation's '% u_BufferTexWidth' would then mix uint with a uniform int
+    // -- illegal at desktop GLSL 330 and an instant parse error. int() is an
+    // identity for the already-int case, so this only ever repairs.
+    // Genuine 2D fetches -- texelFetch(SAMP, ivec2(X, Y), 0) -- are left alone;
+    // the old regex pass turned those into bufferCoords(X, Y), a call whose
+    // arity never matched the helper.
+    static const std::string kFetch = "texelFetch";
+    std::string out;
+    out.reserve(source.size() + 128);
+    size_t copy_from = 0;
+    size_t scan = 0;
+    bool rewrote_any = false;
+    while ((scan = source.find(kFetch, scan)) != std::string::npos) {
+        if (scan > 0 && (std::isalnum((unsigned char)source[scan - 1]) || source[scan - 1] == '_')) {
+            scan += kFetch.size();
+            continue;
+        }
+        size_t p = skip_ws(source, scan + kFetch.size());
+        if (p >= source.size() || source[p] != '(') {
+            scan += kFetch.size();
+            continue;
+        }
+        size_t close = find_matching_paren(source, p);
+        if (close == std::string::npos) break; // unbalanced overall: bail out untouched
+
+        std::vector<std::string> args = split_top_level_args(source, p + 1, close);
+        for (std::string& a : args) a = trim_ws(std::move(a));
+
+        std::string replacement;
+        if (args.size() == 2 && !args[0].empty() && !args[1].empty()) {
+            const std::string& coord = args[1];
+            replacement = "texelFetch(" + args[0] + ", ivec2((int(" + coord + ")) % u_BufferTexWidth, (int(" +
+                          coord + ")) / u_BufferTexWidth), 0)";
+        } else if (args.size() == 3 && args[2] == "0") {
+            std::string inner;
+            if (parse_single_component_ivec2(args[1], inner)) {
+                replacement = "texelFetch(" + args[0] + ", bufferCoords(int(" + inner + ")), 0)";
+            }
+        }
+
+        if (replacement.empty()) {
+            // Not a buffer-style fetch (or malformed): keep as-is and keep
+            // scanning inside it for further calls.
+            scan += kFetch.size();
+            continue;
+        }
+        out.append(source, copy_from, scan - copy_from);
+        out.append(replacement);
+        rewrote_any = true;
+        scan = close + 1;
+        copy_from = scan;
+    }
+    if (rewrote_any) {
+        out.append(source, copy_from, source.size() - copy_from);
+        source = std::move(out);
+    }
 
     const char* boundaryProtection = R"(
 ivec2 bufferCoords(int index) {
@@ -517,9 +695,6 @@ ivec2 bufferCoords(int index) {
     return ivec2(x, y);
 }
 )";
-
-    source = std::regex_replace(source, std::regex("texelFetch\\((\\w+)\\s*,\\s*ivec2\\(([^)]+)\\)\\s*,\\s*0\\)"),
-                                "texelFetch($1, bufferCoords($2), 0)");
 
     size_t insertion_point = find_insertion_point(source);
     if (insertion_point != std::string::npos) {
@@ -683,7 +858,7 @@ int get_or_add_glsl_version(std::string& glsl) {
 }
 
 std::vector<unsigned int> glsl_to_spirv(GLenum shader_type, int glsl_version, const char* const* shader_src,
-                                        int& errc) {
+                                        int& errc, bool safe_mode = false) {
     EShLanguage shader_language;
     switch (shader_type) {
     case GL_VERTEX_SHADER:
@@ -724,16 +899,23 @@ std::vector<unsigned int> glsl_to_spirv(GLenum shader_type, int glsl_version, co
     TBuiltInResource TBuiltInResource_resources = InitResources();
 
     if (!shader.parse(&TBuiltInResource_resources, glsl_version, true, EShMsgDefault)) {
+        // Always report parse failures: on iOS this is the only way to see
+        // WHY the desktop-GLSL -> SPIR-V stage failed (it is currently broken
+        // there and silently falls back to raw desktop GLSL, which the host
+        // driver then rejects with a misleading "1:1: '' : syntax error").
+        LOG_W_FORCE("GLSL Compiling ERROR (parse, glslver=%d): \n%s", glsl_version, shader.getInfoLog())
         LOG_D("GLSL Compiling ERROR: \n%s", shader.getInfoLog())
         errc = -1;
         return {};
     }
+    LOG_W_FORCE("GLSL parse OK (glslver=%d)", glsl_version)
     LOG_D("GLSL Compiled.")
 
     glslang::TProgram program;
     program.addShader(&shader);
 
     if (!program.link(EShMsgDefault)) {
+        LOG_W_FORCE("Shader Linking ERROR (glslver=%d): %s", glsl_version, program.getInfoLog())
         LOG_D("Shader Linking ERROR: %s", program.getInfoLog())
         errc = -1;
         return {};
@@ -741,7 +923,10 @@ std::vector<unsigned int> glsl_to_spirv(GLenum shader_type, int glsl_version, co
     LOG_D("Shader Linked.")
     std::vector<unsigned int> spirv_code;
     glslang::SpvOptions spvOptions;
-    spvOptions.disableOptimizer = false;
+    // safe_mode (set by the SIGSEGV-retry path) skips the optional SPIR-V
+    // optimizer pass: if the arm64 fault lives inside it, the unoptimized
+    // SPIR-V still cross-compiles to a valid, working ESSL shader.
+    spvOptions.disableOptimizer = safe_mode;
     glslang::GlslangToSpv(*program.getIntermediate(shader_language), spirv_code, &spvOptions);
     errc = 0;
     return spirv_code;
@@ -770,6 +955,7 @@ static bool spvc_ok(spvc_context context, spvc_result res, const char* what) {
     if (res == SPVC_SUCCESS) {
         return true;
     }
+    LOG_W_FORCE("Error: %s failed in spirv-cross: %s", what, spvc_context_get_last_error_string(context))
     LOG_E("Error: %s failed in spirv-cross: %s", what, spvc_context_get_last_error_string(context))
     return false;
 }
@@ -839,7 +1025,248 @@ std::string spirv_to_essl(std::vector<unsigned int> spirv, uint essl_version, in
 }
 
 static bool glslang_inited = false;
+
+// Coarse pipeline-stage marker, updated before each conversion sub-step. A
+// recovered SIGSEGV reports it so one device log says WHICH stage died
+// (parse / link / SPIR-V codegen+optimizer / SPIRV-Cross / ESSL post).
+// Declared outside the Apple-only guard block because the conversion impl
+// (shared with the desktop harness) updates it unconditionally.
+static thread_local const char* t_conv_stage = "idle";
+
+#if defined(__APPLE__)
+namespace {
+// glslang's recursive-descent parser and its semantic analysis recurse through
+// the whole expression/declaration tree. iOS threads created by pthread_create
+// default to a 512 KB stack and JVM threads get 1-2 MB, while the harness runs
+// with the 8 MB main-thread stack -- which is why complex shaders (Sodium etc.)
+// SIGSEGV'd inside glslang::TParseContext::lValueErrorCheck on-device but never
+// locally. When the calling thread's stack is smaller than 8 MB, run the whole
+// conversion on a dedicated 32 MB-stack thread; results are copied back
+// synchronously. One pthread_create per compiled shader is negligible next to
+// the conversion itself.
+struct BigStackJob {
+    void (*fn)(void*);
+    void* arg;
+};
+
+// ---------------------------------------------------------------------------
+// SIGSEGV safety net for the conversion thread.
+//
+// History: three device builds in a row (2.0.1 .. 2.0.3) died with SIGSEGV at
+// glslang::TParseContext::lValueErrorCheck+0x264 while parsing Minecraft
+// 26.x's position_color vertex shader on iOS/arm64 -- an input that parses
+// fine under x86_64 with the same pinned glslang and is clean under ASan.
+// The fatal fault turned a per-shader GLSL problem into a whole-process kill
+// during startup.
+//
+// The guard below confines that blast radius: while a conversion runs on the
+// dedicated big-stack thread, a SIGSEGV in it unwinds back to the conversion
+// entry via siglongjmp, the failure is logged, and the shader simply fails to
+// convert (a per-shader GLSL error -- Minecraft 26.x can cope with that).
+// Faults on any other thread (or outside a conversion) are forwarded to
+// whatever handler was installed before us (HotSpot, PLCrashReporter, ...).
+// ---------------------------------------------------------------------------
+static thread_local sigjmp_buf t_conv_jmp;
+static thread_local bool t_in_conversion = false;
+static sigjmp_buf dummy_jmp;
+static struct sigaction g_prev_sigsegv{};
+static bool g_prev_sigsegv_valid = false;
+
+// Best-effort crash-site report from inside the signal handler. We are
+// already past the point of caring about strict async-signal-safety (the
+// longjmp below aborts a corrupted computation anyway); what matters is
+// that the offsets land in the log so the arm64 fault can be symbolicated
+// offline against the exact CI dylib, the way lValueErrorCheck+0x264 was.
+static void report_crash_site(siginfo_t* info, void* uctx) {
+    uint64_t pc = 0, lr = 0, far_addr = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+    ucontext_t* uc = (ucontext_t*)uctx;
+    mcontext_t mc = uc ? uc->uc_mcontext : nullptr;
+    if (uc && mc && uc->uc_mcsize >= sizeof(*mc)) {
+        pc = mc->__ss.__pc;
+        lr = mc->__ss.__lr;
+        far_addr = mc->__es.__far;
+    }
+#elif defined(__APPLE__) && defined(__x86_64__)
+    ucontext_t* uc = (ucontext_t*)uctx;
+    mcontext_t mc = uc ? uc->uc_mcontext : nullptr;
+    if (uc && mc && uc->uc_mcsize >= sizeof(*mc)) {
+        pc = mc->__ss.__rip;
+        lr = mc->__ss.__rip;
+        far_addr = mc->__es.__faultvaddr;
+    }
+#else
+    (void)uctx;
+#endif
+    if (pc != 0) {
+        Dl_info dli{};
+        if (dladdr((void*)pc, &dli) && dli.dli_fbase) {
+            uint64_t base = (uint64_t)dli.dli_fbase;
+            const char* img = dli.dli_fname ? strrchr(dli.dli_fname, '/') : nullptr;
+            img = img ? img + 1 : dli.dli_fname;
+            LOG_W_FORCE("[MG] crash site: stage='%s' pc=0x%llx (pc-%s+0x%llx) lr=0x%llx far=0x%llx si_addr=0x%p",
+                        t_conv_stage, (unsigned long long)pc, img ? img : "?",
+                        (unsigned long long)(pc - base), (unsigned long long)lr,
+                        (unsigned long long)far_addr, info ? info->si_addr : nullptr)
+        } else {
+            LOG_W_FORCE("[MG] crash site: stage='%s' pc=0x%llx lr=0x%llx far=0x%llx si_addr=0x%p (module unknown)",
+                        t_conv_stage, (unsigned long long)pc, (unsigned long long)lr,
+                        (unsigned long long)far_addr, info ? info->si_addr : nullptr)
+        }
+    } else {
+        LOG_W_FORCE("[MG] crash site: stage='%s' si_addr=0x%p (pc unavailable)",
+                    t_conv_stage, info ? info->si_addr : nullptr)
+    }
+}
+
+static void conversion_sigsegv_handler(int sig, siginfo_t* info, void* uctx) {
+    if (t_in_conversion) {
+        t_in_conversion = false;
+        report_crash_site(info, uctx);
+        siglongjmp(t_conv_jmp, 1);
+    }
+    // Not ours: forward to the previous handler chain (JVM, PLCrash, ...).
+    if (g_prev_sigsegv_valid && (g_prev_sigsegv.sa_flags & SA_SIGINFO) && g_prev_sigsegv.sa_sigaction) {
+        g_prev_sigsegv.sa_sigaction(sig, info, uctx);
+        return;
+    }
+    if (g_prev_sigsegv_valid && g_prev_sigsegv.sa_handler &&
+        g_prev_sigsegv.sa_handler != SIG_DFL && g_prev_sigsegv.sa_handler != SIG_IGN) {
+        g_prev_sigsegv.sa_handler(sig);
+        return;
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+// Called once per process, at the first conversion. By that time the JVM and
+// PLCrashReporter have already installed their handlers, which we chain to.
+static void install_conversion_sigsegv_guard() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        struct sigaction sa{};
+        sa.sa_sigaction = conversion_sigsegv_handler;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        g_prev_sigsegv_valid = (sigaction(SIGSEGV, &sa, &g_prev_sigsegv) == 0);
+    });
+}
+
+static void* big_stack_trampoline(void* p) {
+    BigStackJob* job = (BigStackJob*)p;
+    job->fn(job->arg);
+    return nullptr;
+}
+
+static bool run_on_big_stack_if_needed(void (*fn)(void*), void* arg) {
+    // ALWAYS run on the dedicated 32 MB-stack thread.  pthread_get_stacksize_np()
+    // is authoritative for pthread-created threads, but the JVM may hand out
+    // large stacks (>= 8 MB) to some of its threads while the glslang recursive
+    // descent still overflows inside them on complex shaders -- and a
+    // mis-detected "plenty of headroom" case crashes the whole game.  The old
+    // ">= 8 MB -> inline" fast path made the behaviour depend on the caller's
+    // stack report; determinism beats the negligible cost of one pthread per
+    // shader compile.
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) return false;
+    if (pthread_attr_setstacksize(&attr, 32u << 20) != 0) {
+        pthread_attr_destroy(&attr);
+        return false;
+    }
+    BigStackJob job{fn, arg};
+    pthread_t tid;
+    int rc = pthread_create(&tid, &attr, big_stack_trampoline, &job);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) return false;
+    pthread_join(tid, nullptr);
+    return true;
+}
+} // namespace
+#endif
+
+struct GLSLtoGLSLES_2_Args {
+    const char* glsl_code;
+    GLenum glsl_type;
+    uint essl_version;
+    int* return_code;
+    std::string* out;
+    // safe_mode: run the SPIR-V pipeline with the optimizer disabled. Used
+    // for the one-shot retry after a recovered SIGSEGV -- the optimizer is an
+    // optional transform, so if a crash lives in it, the retry converts the
+    // shader for real instead of falling back to unusable raw desktop GLSL.
+    bool safe_mode = false;
+};
+
+static void GLSLtoGLSLES_2_impl(const char* glsl_code, GLenum glsl_type, uint essl_version,
+                                int& return_code, std::string& out, bool safe_mode = false);
+
+static void GLSLtoGLSLES_2_entry(void* p) {
+    GLSLtoGLSLES_2_Args* a = (GLSLtoGLSLES_2_Args*)p;
+#if defined(__APPLE__)
+    if (sigsetjmp(t_conv_jmp, 1) != 0) {
+        // SIGSEGV inside glslang/SPIRV-Cross on this dedicated thread (see
+        // the guard notes above). Report a clean per-shader failure instead
+        // of dying: -999 marks "conversion crashed" for the caller's log.
+        LOG_W_FORCE("[MG] shader conversion CRASHED (SIGSEGV recovered on 32MB-stack thread, stage='%s', len=%zu, head='%.96s') -- reporting conversion failure",
+                    t_conv_stage, strlen(a->glsl_code), a->glsl_code)
+        *a->return_code = -999;
+        a->out->clear();
+        return;
+    }
+    t_in_conversion = true;
+    GLSLtoGLSLES_2_impl(a->glsl_code, a->glsl_type, a->essl_version, *a->return_code, *a->out, a->safe_mode);
+    t_in_conversion = false;
+#else
+    GLSLtoGLSLES_2_impl(a->glsl_code, a->glsl_type, a->essl_version, *a->return_code, *a->out);
+#endif
+}
+
 std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_version, int& return_code) {
+#if defined(__APPLE__)
+    std::string out;
+    int rc = 0;
+    GLSLtoGLSLES_2_Args args{glsl_code, glsl_type, essl_version, &rc, &out};
+    // Log BEFORE the conversion so a crash inside glslang is attributable:
+    // if the next log shows this line but no completion, the SEGV happened on
+    // the dedicated 32 MB stack (=> a real glslang bug, not a stack overflow).
+#if defined(__APPLE__)
+    install_conversion_sigsegv_guard();
+#endif
+    LOG_V("[MG] shader conversion dispatched to dedicated 32MB-stack thread (len=%zu, head='%.96s')",
+          strlen(glsl_code), glsl_code)
+    if (run_on_big_stack_if_needed(&GLSLtoGLSLES_2_entry, &args)) {
+        if (rc == -999) {
+            // One recovery shot in safe mode: the SPIR-V optimizer is an
+            // optional pass, and if the arm64 fault lives inside it, running
+            // without it turns a dead pipeline back into a working shader.
+            // Each run_on_big_stack_if_needed() call spawns a fresh pthread,
+            // so the retry also starts from clean glslang state.
+            int rc2 = 0;
+            std::string out2;
+            GLSLtoGLSLES_2_Args args2{glsl_code, glsl_type, essl_version, &rc2, &out2, true};
+            LOG_W_FORCE("[MG] conversion crashed -- retrying once with SPIR-V optimizer disabled (len=%zu, head='%.96s')",
+                        strlen(glsl_code), glsl_code)
+            if (run_on_big_stack_if_needed(&GLSLtoGLSLES_2_entry, &args2) && rc2 == 0 && !out2.empty()) {
+                LOG_W_FORCE("[MG] conversion SUCCEEDED on optimizer-disabled retry (len=%zu) -- the SPIR-V optimizer path is the crasher",
+                            strlen(glsl_code))
+                return_code = rc2;
+                return out2;
+            }
+            LOG_W_FORCE("[MG] optimizer-disabled retry did not produce a usable shader (rc=%d) -- reporting conversion failure", rc2)
+        }
+        return_code = rc;
+        return out;
+    }
+    LOG_W_FORCE("[MG] shader conversion falling back to inline execution (big-stack thread unavailable)")
+#endif
+    std::string out2;
+    GLSLtoGLSLES_2_impl(glsl_code, glsl_type, essl_version, return_code, out2);
+    return out2;
+}
+
+static void GLSLtoGLSLES_2_impl(const char* glsl_code, GLenum glsl_type, uint essl_version,
+                                int& return_code, std::string& out, bool safe_mode) {
+    t_conv_stage = "preprocess";
     std::string correct_glsl_str = preprocess_glsl(glsl_code, glsl_type);
     LOG_D("Firstly converted GLSL:\n%s", correct_glsl_str.c_str())
     int glsl_version = get_or_add_glsl_version(correct_glsl_str);
@@ -850,19 +1277,24 @@ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_ve
     }
     const char* s[] = {correct_glsl_str.c_str()};
     int errc = 0;
-    std::vector<unsigned int> spirv_code = glsl_to_spirv(glsl_type, glsl_version, s, errc);
+    t_conv_stage = "glslang-parse+link+spv";
+    std::vector<unsigned int> spirv_code = glsl_to_spirv(glsl_type, glsl_version, s, errc, safe_mode);
     if (errc != 0) {
         return_code = -1;
-        return "";
+        out.clear();
+        return;
     }
     errc = 0;
+    t_conv_stage = "spirv-cross";
     std::string essl = spirv_to_essl(spirv_code, essl_version, errc);
     if (errc != 0) {
         return_code = -2;
-        return "";
+        out.clear();
+        return;
     }
 
     // Post-processing ESSL
+    t_conv_stage = "essl-postprocess";
 
     if (glsl_type != GL_COMPUTE_SHADER) {
         essl = removeLayoutBinding(essl);
@@ -870,9 +1302,10 @@ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_ve
     essl = processOutColorLocations(essl);
     essl = forceSupporterOutput(essl);
 
+    t_conv_stage = "done";
     LOG_D("Originally GLSL to GLSL ES Complete: \n%s", essl.c_str())
     return_code = errc;
-    return essl;
+    out = std::move(essl);
 }
 
 std::string GLSLtoGLSLES_1(const char* glsl_code, GLenum glsl_type, uint esversion, int& return_code) { // useless now

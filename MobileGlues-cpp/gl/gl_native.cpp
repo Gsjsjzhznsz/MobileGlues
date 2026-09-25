@@ -55,7 +55,10 @@ NATIVE_FUNCTION_HEAD(void, glDepthRangef, GLfloat n, GLfloat f) NATIVE_FUNCTION_
 NATIVE_FUNCTION_HEAD(void, glDetachShader, GLuint program, GLuint shader) NATIVE_FUNCTION_END_NO_RETURN(void, glDetachShader, program,shader)
 // NATIVE_FUNCTION_HEAD(void, glDisable, GLenum cap) NATIVE_FUNCTION_END_NO_RETURN(void, glDisable, cap)   // moved to gl/enable.cpp (virtual enable state table)
 NATIVE_FUNCTION_HEAD(void, glDisableVertexAttribArray, GLuint index) NATIVE_FUNCTION_END_NO_RETURN(void, glDisableVertexAttribArray, index)
-NATIVE_FUNCTION_HEAD(void, glDrawArrays, GLenum mode, GLint first, GLsizei count) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawArrays, mode,first,count)
+// moved to gl/drawing.cpp (draw-time prepareForDraw hook: MC 26.x's
+// transparency composite draws through glDrawArrays, and the composite's
+// depth-sort is what the TBO emulation and the sampler diagnostics ride on)
+//NATIVE_FUNCTION_HEAD(void, glDrawArrays, GLenum mode, GLint first, GLsizei count) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawArrays, mode,first,count)
 //NATIVE_FUNCTION_HEAD(void, glDrawElements, GLenum mode, GLsizei count, GLenum type, const void *indices) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawElements, mode,count,type,indices)
 // NATIVE_FUNCTION_HEAD(void, glEnable, GLenum cap) NATIVE_FUNCTION_END_NO_RETURN(void, glEnable, cap)   // moved to gl/enable.cpp (virtual enable state table)
 NATIVE_FUNCTION_HEAD(void, glEnableVertexAttribArray, GLuint index) NATIVE_FUNCTION_END_NO_RETURN(void, glEnableVertexAttribArray, index)
@@ -222,7 +225,7 @@ NATIVE_FUNCTION_HEAD(GLuint, glGetUniformBlockIndex, GLuint program, const GLcha
 NATIVE_FUNCTION_HEAD(void, glGetActiveUniformBlockiv, GLuint program, GLuint uniformBlockIndex, GLenum pname, GLint *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetActiveUniformBlockiv, program,uniformBlockIndex,pname,params)
 NATIVE_FUNCTION_HEAD(void, glGetActiveUniformBlockName, GLuint program, GLuint uniformBlockIndex, GLsizei bufSize, GLsizei *length, GLchar *uniformBlockName) NATIVE_FUNCTION_END_NO_RETURN(void, glGetActiveUniformBlockName, program,uniformBlockIndex,bufSize,length,uniformBlockName)
 NATIVE_FUNCTION_HEAD(void, glUniformBlockBinding, GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding) NATIVE_FUNCTION_END_NO_RETURN(void, glUniformBlockBinding, program,uniformBlockIndex,uniformBlockBinding)
-NATIVE_FUNCTION_HEAD(void, glDrawArraysInstanced, GLenum mode, GLint first, GLsizei count, GLsizei instancecount) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawArraysInstanced, mode,first,count,instancecount)
+// NATIVE_FUNCTION_HEAD(void, glDrawArraysInstanced, GLenum mode, GLint first, GLsizei count, GLsizei instancecount) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawArraysInstanced, mode,first,count,instancecount)   // moved to gl/drawing.cpp: MC 26.2 routes every non-indexed draw (the transparency composite included) through it, and it must reach prepareForDraw
 // NATIVE_FUNCTION_HEAD(void, glDrawElementsInstanced, GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawElementsInstanced, mode,count,type,indices,instancecount)
 NATIVE_FUNCTION_HEAD(GLsync, glFenceSync, GLenum condition, GLbitfield flags) NATIVE_FUNCTION_END(GLsync, glFenceSync, condition,flags)
 NATIVE_FUNCTION_HEAD(GLboolean, glIsSync, GLsync sync) NATIVE_FUNCTION_END(GLboolean, glIsSync, sync)
@@ -233,13 +236,14 @@ NATIVE_FUNCTION_HEAD(void, glWaitSync, GLsync sync, GLbitfield flags, GLuint64 t
 NATIVE_FUNCTION_HEAD(void, glGetSynciv, GLsync sync, GLenum pname, GLsizei bufSize, GLsizei *length, GLint *values) NATIVE_FUNCTION_END_NO_RETURN(void, glGetSynciv, sync,pname,bufSize,length,values)
 NATIVE_FUNCTION_HEAD(void, glGetInteger64i_v, GLenum target, GLuint index, GLint64 *data) NATIVE_FUNCTION_END_NO_RETURN(void, glGetInteger64i_v, target,index,data)
 NATIVE_FUNCTION_HEAD(void, glGetBufferParameteri64v, GLenum target, GLenum pname, GLint64 *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetBufferParameteri64v, target,pname,params)
-NATIVE_FUNCTION_HEAD(void, glGenSamplers, GLsizei count, GLuint *samplers) NATIVE_FUNCTION_END_NO_RETURN(void, glGenSamplers, count,samplers)
-NATIVE_FUNCTION_HEAD(void, glDeleteSamplers, GLsizei count, const GLuint *samplers) NATIVE_FUNCTION_END_NO_RETURN(void, glDeleteSamplers, count,samplers)
+// NATIVE_FUNCTION_HEAD(void, glGenSamplers, GLsizei count, GLuint *samplers) NATIVE_FUNCTION_END_NO_RETURN(void, glGenSamplers, count,samplers)   // moved to gl/texture.cpp: the depth-sampling filter enforcement tracks every sampler object's parameters (MG 2.0.12)
+// NATIVE_FUNCTION_HEAD(void, glDeleteSamplers, GLsizei count, const GLuint *samplers) NATIVE_FUNCTION_END_NO_RETURN(void, glDeleteSamplers, count,samplers)   // moved to gl/texture.cpp: forget the deleted sampler's record and per-unit shadow
 NATIVE_FUNCTION_HEAD(GLboolean, glIsSampler, GLuint sampler) NATIVE_FUNCTION_END(GLboolean, glIsSampler, sampler)
-NATIVE_FUNCTION_HEAD(void, glBindSampler, GLuint unit, GLuint sampler) NATIVE_FUNCTION_END_NO_RETURN(void, glBindSampler, unit,sampler)
-NATIVE_FUNCTION_HEAD(void, glSamplerParameteri, GLuint sampler, GLenum pname, GLint param) NATIVE_FUNCTION_END_NO_RETURN(void, glSamplerParameteri, sampler,pname,param)
+// NATIVE_FUNCTION_HEAD(void, glBindSampler, GLuint unit, GLuint sampler) NATIVE_FUNCTION_END_NO_RETURN(void, glBindSampler, unit,sampler)   // moved to gl/texture.cpp: the depth-sampling filter enforcement needs the per-unit sampler binding shadow
+// NATIVE_FUNCTION_HEAD(void, glSamplerParameteri, GLuint sampler, GLenum pname, GLint param) NATIVE_FUNCTION_END_NO_RETURN(void, glSamplerParameteri, sampler,pname,param)   // moved to gl/texture.cpp: parameter records + stale-force invalidation
+// NATIVE_FUNCTION_HEAD(void, glSamplerParameterf, GLuint sampler, GLenum pname, GLfloat param) NATIVE_FUNCTION_END_NO_RETURN(void, glSamplerParameterf, sampler,pname,param)   // moved to gl/texture.cpp: parameter records + stale-force invalidation
 NATIVE_FUNCTION_HEAD(void, glSamplerParameteriv, GLuint sampler, GLenum pname, const GLint *param) NATIVE_FUNCTION_END_NO_RETURN(void, glSamplerParameteriv, sampler,pname,param)
-NATIVE_FUNCTION_HEAD(void, glSamplerParameterf, GLuint sampler, GLenum pname, GLfloat param) NATIVE_FUNCTION_END_NO_RETURN(void, glSamplerParameterf, sampler,pname,param)
+// NATIVE_FUNCTION_HEAD(void, glSamplerParameterf, GLuint sampler, GLenum pname, GLfloat param) NATIVE_FUNCTION_END_NO_RETURN(void, glSamplerParameterf, sampler,pname,param)   // moved to gl/texture.cpp: parameter records + stale-force invalidation (MG 2.0.12)
 NATIVE_FUNCTION_HEAD(void, glSamplerParameterfv, GLuint sampler, GLenum pname, const GLfloat *param) NATIVE_FUNCTION_END_NO_RETURN(void, glSamplerParameterfv, sampler,pname,param)
 NATIVE_FUNCTION_HEAD(void, glGetSamplerParameteriv, GLuint sampler, GLenum pname, GLint *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetSamplerParameteriv, sampler,pname,params)
 NATIVE_FUNCTION_HEAD(void, glGetSamplerParameterfv, GLuint sampler, GLenum pname, GLfloat *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetSamplerParameterfv, sampler,pname,params)
