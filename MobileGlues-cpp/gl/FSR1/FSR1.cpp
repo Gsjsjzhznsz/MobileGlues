@@ -4,7 +4,23 @@
 //   https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
 // SPDX-License-Identifier: LGPL-2.1-only
 // End of Source File Header
+//
+// mg-3backends FSR1: Arm Accuracy Super Resolution (FFXM FSR1), two passes.
+//
+//   pass 1  EASU : g_renderTexture (render res) -> g_targetTexture (surface res)
+//   pass 2  RCAS : g_targetTexture (surface res) -> real framebuffer 0 (surface)
+//
+// This replaces the old single-pass AMD port, which had three fatal defects:
+// its one fragment shader computed EASU and then discarded the result (RCAS
+// sampled the raw input texture), its textureGather-based EASU could not be
+// transpiled to ESSL 300 at all (SPIRV-Cross rejects OpImageGather below ESSL
+// 310, so the raw GLSL 450 source reached the driver and never compiled), and
+// its resolution bookkeeping let the surface query overwrite the render size
+// every frame, which reduced FSR to a wasted up- and downscale. The Arm
+// upgrade is only worth what the plumbing around it is; the plumbing below is
+// what makes the presets real.
 #include "FSR1.h"
+#include <cstdio>
 #include <mutex>
 #include <ska/flat_hash_map.hpp>
 #include "FSRShaderSource.h"
@@ -24,6 +40,10 @@ enum GLStateBits : unsigned int {
     GUARD_TEXTURE = 1u << 3,
     GUARD_FRAMEBUFFER = 1u << 4,
     GUARD_RENDERBUFFER = 1u << 5,
+    // Enables the passes need off (they draw one opaque fullscreen quad) plus
+    // the color mask, none of which the application is required to have reset.
+    GUARD_ENABLES = 1u << 6,
+    GUARD_COLOR_MASK = 1u << 7,
 };
 
 // Saves the GL state the bodies in this file overwrite and puts it back.
@@ -37,30 +57,26 @@ enum GLStateBits : unsigned int {
 //     render target already resolved, and it is the only file that binds a draw
 //     framebuffer through GLES other than this one. It also keeps that field off
 //     deleted names, through its own glDeleteFramebuffers -- with one exception,
-//     RecreateFSRFBO, which deletes the render FBO behind its back and so has to
-//     republish the replacement itself. A saved name has to be live: restoring one
-//     GL has deleted is rejected, and the binding then stays wherever the body left
-//     it.
+//     RecreateRenderTargets, which deletes the render FBO behind its back and so
+//     has to republish the replacement itself. A saved name has to be live:
+//     restoring one GL has deleted is rejected, and the binding then stays wherever
+//     the body left it.
 //
 // Asked of the driver, because nothing in the tree can answer:
 //   - the vertex array. What this layer tracks is the application's name, the
-//     mapping to the driver's lives in gl/buffer.cpp and is not exported, and the
-//     tracked name outlives glDeleteVertexArrays -- restoring from it could hand
-//     GLES a name it never generated.
+//     mapping to the driver's lives in gl/buffer.cpp and is not exported, and
+//     the tracked name outlives glDeleteVertexArrays -- restoring from it could
+//     hand GLES a name it never generated.
 //   - the active unit and unit 0's GL_TEXTURE_2D binding. gl/texture.h's driver
 //     shadow declines to answer while FSR1 is enabled, which is exactly when this
 //     runs. The active unit has to come from the driver in any case: these guards
-//     nest, the moves below go straight to GLES and so never reach that shadow, and
-//     an inner guard reading it would restore the outer guard's unit and leave the
-//     body running on a unit it never asked for.
+//     nest, the moves below go straight to GLES and so never reach that shadow,
+//     and an inner guard reading it would restore the outer guard's unit and leave
+//     the body running on a unit it never asked for.
 //   - the read framebuffer and the renderbuffer binding, which nothing tracks.
-//
-// The texture entry is unit 0, not whichever unit happened to be active. Unit 0 is
-// the unit ApplyFSR samples the render texture from, so it is the binding that has
-// to be preserved; saving the active unit's instead left the FSR1 render texture on
-// unit 0 once per presented frame with nothing anywhere to put the application's
-// texture back. gl/texture.cpp's driver-side shadow was narrowed around that leak
-// and can be widened again now that it is gone.
+//   - the enables and the color mask, tracked by the frontend's virtual enable
+//     table only where it opts to answer; the driver read is the honest answer
+//     and this runs once per frame.
 struct GLStateGuard {
     unsigned int saved;
     GLint prevProgram = 0;
@@ -71,6 +87,8 @@ struct GLStateGuard {
     GLint prevReadFBO = 0;
     GLint prevDrawFBO = 0;
     GLint prevRenderbuffer = 0;
+    GLboolean prevScissor = GL_FALSE, prevBlend = GL_FALSE, prevDepth = GL_FALSE, prevCull = GL_FALSE;
+    GLboolean prevMask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
 
     explicit GLStateGuard(unsigned int bits) : saved(bits) {
         if (saved & GUARD_PROGRAM) prevProgram = static_cast<GLint>(gl_state->current_program);
@@ -86,16 +104,30 @@ struct GLStateGuard {
             prevDrawFBO = static_cast<GLint>(gl_state->current_draw_fbo);
         }
         if (saved & GUARD_RENDERBUFFER) GLES.glGetIntegerv(GL_RENDERBUFFER_BINDING, &prevRenderbuffer);
+        if (saved & GUARD_ENABLES) {
+            prevScissor = GLES.glIsEnabled(GL_SCISSOR_TEST);
+            prevBlend = GLES.glIsEnabled(GL_BLEND);
+            prevDepth = GLES.glIsEnabled(GL_DEPTH_TEST);
+            prevCull = GLES.glIsEnabled(GL_CULL_FACE);
+            GLES.glDisable(GL_SCISSOR_TEST);
+            GLES.glDisable(GL_BLEND);
+            GLES.glDisable(GL_DEPTH_TEST);
+            GLES.glDisable(GL_CULL_FACE);
+        }
+        if (saved & GUARD_COLOR_MASK) {
+            GLES.glGetBooleanv(GL_COLOR_WRITEMASK, prevMask);
+            GLES.glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        }
     }
 
     // Follow a framebuffer this guard saved through a delete-and-recreate.
     //
     // A saved name that the body then deletes cannot be restored: GL rejects it and
-    // leaves the binding wherever the body happened to put it. RecreateFSRFBO is the
-    // only body here that deletes framebuffers, and the render FBO is the name
-    // gl/framebuffer.cpp redirects a bind of framebuffer 0 to -- which is the case
-    // this whole path exists for -- so the guard is told where the replacement went
-    // instead of being left to restore a dead name.
+    // leaves the binding wherever the body happened to put it. RecreateRenderTargets
+    // is the only body here that deletes framebuffers, and the render FBO is the
+    // name gl/framebuffer.cpp redirects a bind of framebuffer 0 to -- which is the
+    // case this whole path exists for -- so the guard is told where the replacement
+    // went instead of being left to restore a dead name.
     void framebuffer_recreated(GLuint from, GLuint to) {
         if (!(saved & GUARD_FRAMEBUFFER) || from == 0 || from == to) return;
         if (prevReadFBO == static_cast<GLint>(from)) prevReadFBO = static_cast<GLint>(to);
@@ -103,6 +135,15 @@ struct GLStateGuard {
     }
 
     ~GLStateGuard() {
+        if (saved & GUARD_COLOR_MASK) GLES.glColorMask(prevMask[0], prevMask[1], prevMask[2], prevMask[3]);
+        if (saved & GUARD_ENABLES) {
+            // glIsEnabled told us what to put back; the enables are restored in the
+            // order they were taken so nesting guards compose predictably.
+            if (prevCull) GLES.glEnable(GL_CULL_FACE); else GLES.glDisable(GL_CULL_FACE);
+            if (prevDepth) GLES.glEnable(GL_DEPTH_TEST); else GLES.glDisable(GL_DEPTH_TEST);
+            if (prevBlend) GLES.glEnable(GL_BLEND); else GLES.glDisable(GL_BLEND);
+            if (prevScissor) GLES.glEnable(GL_SCISSOR_TEST); else GLES.glDisable(GL_SCISSOR_TEST);
+        }
         if (saved & GUARD_PROGRAM) GLES.glUseProgram(prevProgram);
         if (saved & GUARD_VAO) GLES.glBindVertexArray(prevVAO);
         if (saved & GUARD_ARRAY_BUFFER) GLES.glBindBuffer(GL_ARRAY_BUFFER, prevArrayBuffer);
@@ -125,65 +166,29 @@ namespace FSR1_Context {
     GLuint g_renderFBO = 0;
     GLuint g_renderTexture = 0;
     GLuint g_depthStencilRBO = 0;
-    GLuint g_quadVAO = 0;
-    GLuint g_quadVBO = 0;
-    GLuint g_fsrProgram = 0;
-
-    // Resolved once, when g_fsrProgram is linked. A uniform location is fixed for
-    // the life of a program object and this one is never relinked, so asking for it
-    // again is a driver-side name lookup per presented frame for an answer that
-    // cannot have changed. -1 is what glGetUniformLocation returns for a name the
-    // linker dropped, and glUniform* ignores it, so an unresolved location needs no
-    // separate "not found" state.
-    GLint g_inputTexLoc = -1;
-    GLint g_const0Loc = -1;
-    GLint g_viewportSizeLoc = -1;
-
     GLuint g_targetFBO = 0;
     GLuint g_targetTexture = 0;
+    GLuint g_quadVAO = 0;
+    GLuint g_quadVBO = 0;
 
-    GLuint g_currentDrawFBO = 0;
-    GLint g_viewport[4] = {0};
-    GLsizei g_targetWidth = 2400;
-    GLsizei g_targetHeight = 1080;
-    GLsizei g_renderWidth = 1200;
-    GLsizei g_renderHeight = 540;
+    GLuint g_easuProgram = 0;
+    GLuint g_rcasProgram = 0;
+
+    GLint g_easuTexLoc = -1;
+    GLint g_easuConLoc[4] = {-1, -1, -1, -1};
+    GLint g_rcasTexLoc = -1;
+    GLint g_rcasConLoc = -1;
+
+    GLsizei g_targetWidth = 0;
+    GLsizei g_targetHeight = 0;
+    GLsizei g_renderWidth = 0;
+    GLsizei g_renderHeight = 0;
     bool g_dirty = false;
 
     bool g_resolutionChanged = false;
     GLsizei g_pendingWidth = 0;
     GLsizei g_pendingHeight = 0;
 } // namespace FSR1_Context
-
-void CalculateTargetResolution(FSR1_Quality_Preset preset, int renderWidth, int renderHeight, int* targetWidth,
-                               int* targetHeight) {
-    float scale;
-    switch (preset) {
-    case FSR1_Quality_Preset::UltraQuality:
-        scale = 1.3f;
-        break;
-    case FSR1_Quality_Preset::Quality:
-        scale = 1.5f;
-        break;
-    case FSR1_Quality_Preset::Balanced:
-        scale = 1.7f;
-        break;
-    case FSR1_Quality_Preset::Performance:
-        scale = 2.0f;
-        break;
-    default:
-        scale = 1.5f;
-        break;
-    }
-
-    *targetWidth = static_cast<int>(renderWidth * scale);
-    *targetHeight = static_cast<int>(renderHeight * scale);
-
-    *targetWidth = (*targetWidth + 1) & ~1;
-    *targetHeight = (*targetHeight + 1) & ~1;
-    LOG_D("Render resolution: %dx%d", renderWidth, renderHeight);
-    LOG_D("Target resolution: %dx%d", *targetWidth, *targetHeight);
-}
 
 void CalculateRenderResolution(FSR1_Quality_Preset preset, int targetWidth, int targetHeight, int* renderWidth,
                                int* renderHeight) {
@@ -212,7 +217,59 @@ void CalculateRenderResolution(FSR1_Quality_Preset preset, int targetWidth, int 
     *renderHeight = (*renderHeight + 1) & ~1;
 }
 
-GLuint CompileFSRShader() {
+// ---------------------------------------------------------------------------
+// Pass constants. Computed with the vendored Arm CPU code so the uvec4 uniforms
+// are bit-identical to what the shader-side ffxFsrPopulateEasuConstants() would
+// produce. Kept as plain arrays: they are handed straight to glUniform4uiv.
+// ---------------------------------------------------------------------------
+
+namespace {
+GLuint g_cachedEasuCon[4][4];
+GLuint g_cachedRcasCon[4];
+ GLsizei g_cachedEasuInputW = 0, g_cachedEasuInputH = 0;
+ GLsizei g_cachedEasuOutputW = 0, g_cachedEasuOutputH = 0;
+constexpr GLfloat kRcasSharpnessStops = 0.2f; // 0 = max sharpness, N = halve it N times
+
+void RefreshFSRConstants() {
+    if (FSR1_Context::g_renderWidth == g_cachedEasuInputW && FSR1_Context::g_renderHeight == g_cachedEasuInputH &&
+        FSR1_Context::g_targetWidth == g_cachedEasuOutputW && FSR1_Context::g_targetHeight == g_cachedEasuOutputH &&
+        g_cachedEasuOutputW != 0) {
+        return;
+    }
+
+    FFXM_CPU_NS::FfxUInt32x4 con0 = {0, 0, 0, 0};
+    FFXM_CPU_NS::FfxUInt32x4 con1 = {0, 0, 0, 0};
+    FFXM_CPU_NS::FfxUInt32x4 con2 = {0, 0, 0, 0};
+    FFXM_CPU_NS::FfxUInt32x4 con3 = {0, 0, 0, 0};
+    FFXM_CPU_NS::ffxFsrPopulateEasuConstants(
+        con0, con1, con2, con3,
+        static_cast<FfxFloat32>(FSR1_Context::g_renderWidth), static_cast<FfxFloat32>(FSR1_Context::g_renderHeight),
+        static_cast<FfxFloat32>(FSR1_Context::g_renderWidth), static_cast<FfxFloat32>(FSR1_Context::g_renderHeight),
+        static_cast<FfxFloat32>(FSR1_Context::g_targetWidth), static_cast<FfxFloat32>(FSR1_Context::g_targetHeight));
+    for (int i = 0; i < 4; ++i) {
+        g_cachedEasuCon[0][i] = con0[i];
+        g_cachedEasuCon[1][i] = con1[i];
+        g_cachedEasuCon[2][i] = con2[i];
+        g_cachedEasuCon[3][i] = con3[i];
+    }
+
+    FFXM_CPU_NS::FfxUInt32x4 rcas = {0, 0, 0, 0};
+    FFXM_CPU_NS::FsrRcasCon(rcas, kRcasSharpnessStops);
+    for (int i = 0; i < 4; ++i) g_cachedRcasCon[i] = rcas[i];
+
+    g_cachedEasuInputW = FSR1_Context::g_renderWidth;
+    g_cachedEasuInputH = FSR1_Context::g_renderHeight;
+    g_cachedEasuOutputW = FSR1_Context::g_targetWidth;
+    g_cachedEasuOutputH = FSR1_Context::g_targetHeight;
+}
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Program and resource setup.
+// ---------------------------------------------------------------------------
+
+// One VS serves both passes; each pass contributes its own fragment shader.
+GLuint CompileFSRProgram(const char* fragmentSource) {
     GLuint program = glCreateProgram();
 
     GLuint vs = glCreateShader(GL_VERTEX_SHADER);
@@ -225,20 +282,23 @@ GLuint CompileFSRShader() {
     if (!status) {
         char log[512];
         glGetShaderInfoLog(vs, 512, nullptr, log);
-        LOG_F("Vertex shader error: %s\n", log);
+        LOG_F("FSR1 vertex shader error: %s\n", log);
+        glDeleteShader(vs);
         return 0;
     }
 
     GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
-    LOG_D("Fragment shader source:\n%s", FSR_FSSource);
-    glShaderSource(fs, 1, &FSR_FSSource, nullptr);
+    LOG_D("Fragment shader source:\n%s", fragmentSource);
+    glShaderSource(fs, 1, &fragmentSource, nullptr);
     glCompileShader(fs);
 
     glGetShaderiv(fs, GL_COMPILE_STATUS, &status);
     if (!status) {
         char log[512];
         glGetShaderInfoLog(fs, 512, nullptr, log);
-        LOG_F("Fragment shader error: %s\n", log);
+        LOG_F("FSR1 fragment shader error: %s\n", log);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
         return 0;
     }
 
@@ -250,7 +310,9 @@ GLuint CompileFSRShader() {
     if (!status) {
         char log[512];
         glGetProgramInfoLog(program, 512, nullptr, log);
-        LOG_F("Program link error: %s\n", log);
+        LOG_F("FSR1 program link error: %s\n", log);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
         return 0;
     }
 
@@ -284,42 +346,24 @@ void InitFullscreenQuad() {
     GLES.glBindVertexArray(0);
 }
 
-bool fsrInitialized = false;
-void InitFSRResources() {
-    fsrInitialized = true;
-    // No GUARD_VAO or GUARD_ARRAY_BUFFER: the only thing here that binds either is
-    // InitFullscreenQuad, which carries its own guard.
-    GLStateGuard state(GUARD_PROGRAM | GUARD_TEXTURE | GUARD_FRAMEBUFFER | GUARD_RENDERBUFFER);
+namespace {
 
-    FSR1_Context::g_fsrProgram = CompileFSRShader();
-
-    FSR1_Context::g_inputTexLoc = glGetUniformLocation(FSR1_Context::g_fsrProgram, "uInputTex");
-    FSR1_Context::g_const0Loc = glGetUniformLocation(FSR1_Context::g_fsrProgram, "uConst0");
-    FSR1_Context::g_viewportSizeLoc = glGetUniformLocation(FSR1_Context::g_fsrProgram, "uViewportSize");
-
-    // GLES.glUseProgram and not this layer's own: the frontend one writes
-    // gl_state->current_program, and the guard above restores the driver from that
-    // same field. Going through the frontend here would leave the tracked program
-    // saying 0 while the driver holds the application's, and gl/program.cpp then
-    // drops the application's next glUseProgram(0) as redundant.
-    //
-    // The sampler is set once, here. It is program state, not context state, and
-    // this program is never relinked, so ApplyFSR does not repeat it per frame.
-    GLES.glUseProgram(FSR1_Context::g_fsrProgram);
-    GLES.glUniform1i(FSR1_Context::g_inputTexLoc, 0);
-    GLES.glUseProgram(0);
-
-    InitFullscreenQuad();
-
-    GLES.glGenTextures(1, &FSR1_Context::g_renderTexture);
-    GLES.glBindTexture(GL_TEXTURE_2D, FSR1_Context::g_renderTexture);
-    GLES.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight, 0, GL_RGBA,
-                      GL_UNSIGNED_BYTE, nullptr);
+void CreateTexture2D(GLuint* texture, GLsizei width, GLsizei height) {
+    GLES.glGenTextures(1, texture);
+    GLES.glBindTexture(GL_TEXTURE_2D, *texture);
+    GLES.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+}
+
+// The render set is what gl/framebuffer.cpp's redirect names: color texture,
+// depth/stencil and the FBO that binds them. The frontend tracks the FBO name,
+// so a recreation has to republish the replacement (see below).
+void CreateRenderSet() {
+    CreateTexture2D(&FSR1_Context::g_renderTexture, FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight);
 
     GLES.glGenRenderbuffers(1, &FSR1_Context::g_depthStencilRBO);
     GLES.glBindRenderbuffer(GL_RENDERBUFFER, FSR1_Context::g_depthStencilRBO);
@@ -331,27 +375,85 @@ void InitFSRResources() {
     GLES.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, FSR1_Context::g_renderTexture, 0);
     GLES.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
                                    FSR1_Context::g_depthStencilRBO);
+}
 
-    GLES.glGenTextures(1, &FSR1_Context::g_targetTexture);
-    GLES.glBindTexture(GL_TEXTURE_2D, FSR1_Context::g_targetTexture);
-    GLES.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight, 0, GL_RGBA,
-                      GL_UNSIGNED_BYTE, nullptr);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+void CreateIntermediate() {
+    CreateTexture2D(&FSR1_Context::g_targetTexture, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight);
 
     GLES.glGenFramebuffers(1, &FSR1_Context::g_targetFBO);
     GLES.glBindFramebuffer(GL_FRAMEBUFFER, FSR1_Context::g_targetFBO);
     GLES.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, FSR1_Context::g_targetTexture, 0);
+}
+
+} // namespace
+
+bool fsrInitialized = false;
+void InitFSRResources() {
+    fsrInitialized = true;
+    // No GUARD_VAO or GUARD_ARRAY_BUFFER: the only thing here that binds either is
+    // InitFullscreenQuad, which carries its own guard.
+    GLStateGuard state(GUARD_PROGRAM | GUARD_TEXTURE | GUARD_FRAMEBUFFER | GUARD_RENDERBUFFER | GUARD_ENABLES |
+                       GUARD_COLOR_MASK);
+
+    FSR1_Context::g_easuProgram = CompileFSRProgram(FSR_EASU_FSSource);
+    FSR1_Context::g_rcasProgram = CompileFSRProgram(FSR_RCAS_FSSource);
+
+    // A program that failed to compile leaves this file claiming an upscale that
+    // cannot draw: the app would render into the redirect while nothing ever
+    // presents it, which reads as a black screen. Tear the whole thing back down
+    // instead -- no redirect, no FSR, the game renders exactly as it would with
+    // FSR1 disabled -- and let the log say why.
+    if (FSR1_Context::g_easuProgram == 0 || FSR1_Context::g_rcasProgram == 0) {
+        LOG_F("FSR1 disabled: program compilation failed")
+        fsrInitialized = false;
+        return;
+    }
+
+    FSR1_Context::g_easuTexLoc = glGetUniformLocation(FSR1_Context::g_easuProgram, "uInputTex");
+    for (int i = 0; i < 4; ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "uEasuCon%d", i);
+        FSR1_Context::g_easuConLoc[i] = glGetUniformLocation(FSR1_Context::g_easuProgram, name);
+    }
+    FSR1_Context::g_rcasTexLoc = glGetUniformLocation(FSR1_Context::g_rcasProgram, "uInputTex");
+    FSR1_Context::g_rcasConLoc = glGetUniformLocation(FSR1_Context::g_rcasProgram, "uRcasCon");
+
+    InitFullscreenQuad();
+
+    // Initial sizes. The first presented frame's CheckResolutionChange replaces
+    // both with the real surface size before anything but test output has been
+    // drawn into them.
+    FSR1_Context::g_targetWidth = 1280;
+    FSR1_Context::g_targetHeight = 720;
+    FSR1_Context::g_renderWidth = 960;
+    FSR1_Context::g_renderHeight = 540;
+    CreateRenderSet();
+    CreateIntermediate();
+    RefreshFSRConstants();
+
+    // GLES.glUseProgram and not this layer's own: the frontend one writes
+    // gl_state->current_program, and the guard above restores the driver from that
+    // same field. Going through the frontend here would leave the tracked program
+    // saying 0 while the driver holds the application's, and gl/program.cpp then
+    // drops the application's next glUseProgram(0) as redundant.
+    //
+    // The samplers and the RCAS constant are set once, here. They are program
+    // state, not context state, and these programs are never relinked, so
+    // ApplyFSR does not repeat them per frame. The RCAS constant depends on
+    // sharpness only, never on a resolution, so one upload lasts forever.
+    GLES.glUseProgram(FSR1_Context::g_easuProgram);
+    GLES.glUniform1i(FSR1_Context::g_easuTexLoc, 0);
+    GLES.glUseProgram(FSR1_Context::g_rcasProgram);
+    GLES.glUniform1i(FSR1_Context::g_rcasTexLoc, 0);
+    GLES.glUniform4uiv(FSR1_Context::g_rcasConLoc, 1, g_cachedRcasCon);
+    GLES.glUseProgram(0);
 
     GLES.glBindFramebuffer(GL_FRAMEBUFFER, FSR1_Context::g_renderFBO);
 }
 
-void RecreateFSRFBO() {
+void RecreateRenderTargets() {
     // No GUARD_PROGRAM, GUARD_VAO or GUARD_ARRAY_BUFFER: nothing below binds any of
-    // the three. The program is not recompiled here either, so the uniform
+    // the three. The programs are not recompiled here either, so the uniform
     // locations resolved at link time stay valid across a resolution change.
     GLStateGuard state(GUARD_TEXTURE | GUARD_FRAMEBUFFER | GUARD_RENDERBUFFER);
     // The names about to stop existing. Everything that still refers to either of
@@ -365,38 +467,8 @@ void RecreateFSRFBO() {
     GLES.glDeleteFramebuffers(1, &FSR1_Context::g_targetFBO);
     GLES.glDeleteTextures(1, &FSR1_Context::g_targetTexture);
 
-    GLES.glGenTextures(1, &FSR1_Context::g_renderTexture);
-    GLES.glBindTexture(GL_TEXTURE_2D, FSR1_Context::g_renderTexture);
-    GLES.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight, 0,
-                      GL_RGBA, GL_FLOAT, nullptr);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-    GLES.glGenRenderbuffers(1, &FSR1_Context::g_depthStencilRBO);
-    GLES.glBindRenderbuffer(GL_RENDERBUFFER, FSR1_Context::g_depthStencilRBO);
-    GLES.glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, FSR1_Context::g_renderWidth,
-                               FSR1_Context::g_renderHeight);
-    GLES.glGenFramebuffers(1, &FSR1_Context::g_renderFBO);
-    GLES.glBindFramebuffer(GL_FRAMEBUFFER, FSR1_Context::g_renderFBO);
-    GLES.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, FSR1_Context::g_renderTexture, 0);
-    GLES.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
-                                   FSR1_Context::g_depthStencilRBO);
-
-    GLES.glGenTextures(1, &FSR1_Context::g_targetTexture);
-    GLES.glBindTexture(GL_TEXTURE_2D, FSR1_Context::g_targetTexture);
-    GLES.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight, 0, GL_RGBA,
-                      GL_UNSIGNED_BYTE, nullptr);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-
-    GLES.glGenFramebuffers(1, &FSR1_Context::g_targetFBO);
-    GLES.glBindFramebuffer(GL_FRAMEBUFFER, FSR1_Context::g_targetFBO);
-    GLES.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, FSR1_Context::g_targetTexture, 0);
+    CreateRenderSet();
+    CreateIntermediate();
 
     // The tracked draw binding names the render FBO for as long as the application
     // is drawing to framebuffer 0, because gl/framebuffer.cpp redirects that bind
@@ -405,9 +477,9 @@ void RecreateFSRFBO() {
     // hook, the one that rebinds 0, is not the path taken here. Left alone, the
     // tracked field would keep naming a dead framebuffer and every GLStateGuard from
     // here on would try to restore it: the restore is rejected, the draw binding
-    // stays on framebuffer 0 where ApplyFSR's blit leaves it, and the application
-    // renders into the surface at render resolution while the upscale keeps reading
-    // a render texture nobody writes.
+    // stays on framebuffer 0 where ApplyFSR's surface pass leaves it, and the
+    // application renders into the surface at render resolution while the upscale
+    // keeps reading a render texture nobody writes.
     //
     // Name 0 is excluded, and it is reachable: this runs once a frame from the swap
     // as soon as FSR1 is switched on, while InitFSRResources waits for the first
@@ -423,7 +495,7 @@ void RecreateFSRFBO() {
     GLES.glBindFramebuffer(GL_FRAMEBUFFER, FSR1_Context::g_renderFBO);
     GLES.glViewport(0, 0, FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight);
 
-    LOG_D("FSR1 resources recreated: render %dx%d, target %dx%d", FSR1_Context::g_renderWidth,
+    LOG_D("FSR1 resources recreated: render %dx%d, surface %dx%d", FSR1_Context::g_renderWidth,
           FSR1_Context::g_renderHeight, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight);
 }
 
@@ -433,39 +505,35 @@ void ApplyFSR() {
     // No GUARD_ARRAY_BUFFER or GUARD_RENDERBUFFER: nothing below binds either.
     // GL_ARRAY_BUFFER_BINDING is context state and not vertex array object state, so
     // the glBindVertexArray below cannot disturb it.
-    GLStateGuard state(GUARD_PROGRAM | GUARD_VAO | GUARD_TEXTURE | GUARD_FRAMEBUFFER);
+    GLStateGuard state(GUARD_PROGRAM | GUARD_VAO | GUARD_TEXTURE | GUARD_FRAMEBUFFER | GUARD_ENABLES |
+                       GUARD_COLOR_MASK);
 
+    RefreshFSRConstants();
+
+    // ---- pass 1: EASU, render texture -> intermediate at surface size ----
     GLES.glBindFramebuffer(GL_FRAMEBUFFER, FSR1_Context::g_targetFBO);
     GLES.glViewport(0, 0, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight);
-    GLES.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    GLES.glClear(GL_COLOR_BUFFER_BIT);
-
-    GLES.glUseProgram(FSR1_Context::g_fsrProgram);
+    GLES.glUseProgram(FSR1_Context::g_easuProgram);
 
     // Unit 0 is already current -- the guard made it so, and it is the unit
     // uInputTex was pointed at when the program was linked.
     GLES.glBindTexture(GL_TEXTURE_2D, FSR1_Context::g_renderTexture);
-
-    // Plain arrays rather than a vector type from a maths library: these two are
-    // handed straight to glUniform*fv, and nothing is ever computed with them.
-    const GLfloat const0[4] = {float(FSR1_Context::g_renderWidth) / FSR1_Context::g_targetWidth,
-                               float(FSR1_Context::g_renderHeight) / FSR1_Context::g_targetHeight,
-                               1.0f / FSR1_Context::g_targetWidth,
-                               1.0f / FSR1_Context::g_targetHeight};
-
-    GLES.glUniform4fv(FSR1_Context::g_const0Loc, 1, const0);
-
-    const GLfloat viewportSize[2] = {(float)FSR1_Context::g_renderWidth,
-                                     (float)FSR1_Context::g_renderHeight};
-    GLES.glUniform2fv(FSR1_Context::g_viewportSizeLoc, 1, viewportSize);
+    GLES.glUniform4uiv(FSR1_Context::g_easuConLoc[0], 1, g_cachedEasuCon[0]);
+    GLES.glUniform4uiv(FSR1_Context::g_easuConLoc[1], 1, g_cachedEasuCon[1]);
+    GLES.glUniform4uiv(FSR1_Context::g_easuConLoc[2], 1, g_cachedEasuCon[2]);
+    GLES.glUniform4uiv(FSR1_Context::g_easuConLoc[3], 1, g_cachedEasuCon[3]);
 
     GLES.glBindVertexArray(FSR1_Context::g_quadVAO);
     GLES.glDrawArrays(GL_TRIANGLES, 0, 6);
 
-    GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, FSR1_Context::g_targetFBO);
-    GLES.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    GLES.glBlitFramebuffer(0, 0, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight, 0, 0,
-                           FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    // ---- pass 2: RCAS, intermediate -> the real surface (framebuffer 0) ----
+    // A plain GLES bind of 0: the frontend's redirect lives a layer above, and
+    // this is the one draw of the frame that has to reach the actual surface.
+    GLES.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    GLES.glViewport(0, 0, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight);
+    GLES.glUseProgram(FSR1_Context::g_rcasProgram);
+    GLES.glBindTexture(GL_TEXTURE_2D, FSR1_Context::g_targetTexture);
+    GLES.glDrawArrays(GL_TRIANGLES, 0, 6);
 
     // The viewport and nothing else. Neither framebuffer binding is worth setting
     // here: the guard restores both on the next line, and what it restores for the
@@ -489,53 +557,98 @@ void CheckResolutionChange(EGLDisplay display, EGLSurface surface) {
     }
     // Both queries stay, once a frame. EGL has no notification for a surface that
     // changed size, and the only other trigger this file has -- the glViewport hook
-    // below -- fires solely when the application asks for a viewport larger than the
-    // last size latched, so it can see neither a surface that shrank nor one the
-    // application never draws full-bleed into. They are also EGL calls, reading
-    // attributes the surface record already holds, not GL commands that have to
-    // reach the driver's command stream.
+    // below -- only sees viewports the application issues on the redirect, so it
+    // can neither see a surface that shrank nor one the application never draws
+    // full-bleed into. They are also EGL calls, reading attributes the surface
+    // record already holds, not GL commands that have to reach the driver's
+    // command stream.
     egl_eglQuerySurface(display, surface, EGL_WIDTH, &width);
     egl_eglQuerySurface(display, surface, EGL_HEIGHT, &height);
     OnResize(width, height);
 
     if (FSR1_Context::g_resolutionChanged) {
         FSR1_Context::g_resolutionChanged = false;
-        GLsizei width = FSR1_Context::g_pendingWidth;
-        GLsizei height = FSR1_Context::g_pendingHeight;
-        FSR1_Context::g_renderWidth = width;
-        FSR1_Context::g_renderHeight = height;
+        FSR1_Context::g_targetWidth = FSR1_Context::g_pendingWidth;
+        FSR1_Context::g_targetHeight = FSR1_Context::g_pendingHeight;
 
-        CalculateTargetResolution(global_settings.fsr1_setting, width, height,
-                                  reinterpret_cast<int*>(&FSR1_Context::g_targetWidth),
-                                  reinterpret_cast<int*>(&FSR1_Context::g_targetHeight));
-        RecreateFSRFBO();
+        // The preset decides how far below the surface the app renders. The old
+        // pipeline had this backwards: it grew the render size with the surface
+        // query and then upscaled past it, buying nothing. Here the surface is
+        // the upscale target and the render resolution is derived from it.
+        CalculateRenderResolution(global_settings.fsr1_setting, FSR1_Context::g_targetWidth,
+                                  FSR1_Context::g_targetHeight, reinterpret_cast<int*>(&FSR1_Context::g_renderWidth),
+                                  reinterpret_cast<int*>(&FSR1_Context::g_renderHeight));
+        RecreateRenderTargets();
     }
     // No glViewport here. This runs immediately after ApplyFSR and the swap, and
     // ApplyFSR ends every frame with exactly this call at exactly this size; on the
-    // one frame where the size does change, RecreateFSRFBO ends with it at the new
-    // size. It was setting the viewport to the value it already held, once per
-    // presented frame.
+    // one frame where the size does change, RecreateRenderTargets ends with it at
+    // the new size. It was setting the viewport to the value it already held, once
+    // per presented frame.
 }
 
 void OnResize(int width, int height) {
-    if (FSR1_Context::g_renderWidth == width && FSR1_Context::g_renderHeight == height) return;
+    if (FSR1_Context::g_targetWidth == width && FSR1_Context::g_targetHeight == height) return;
 
     FSR1_Context::g_pendingWidth = width;
     FSR1_Context::g_pendingHeight = height;
     FSR1_Context::g_resolutionChanged = true;
 }
 
+// ---------------------------------------------------------------------------
+// Viewport and scissor.
+//
+// Both are the frontend's only definitions of these entry points, so every
+// application call goes through here. While the application draws to the
+// redirect (its framebuffer 0), its notion of the window is the surface size,
+// but the pixels land in the render-sized FBO: a full-bleed viewport of surface
+// size would clip the frame to its bottom-left corner. Rewriting the viewport to
+// the render size maps the whole frame onto the render target instead, which is
+// what makes the preset's resolution savings real. Scissor rectangles are
+// framebuffer pixels the application computes at surface size (Minecraft's GUI
+// scissors), so they scale by the same ratio.
+// ---------------------------------------------------------------------------
+
 void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
     LOG()
     LOG_D("glViewport: x=%d, y=%d, w=%d, h=%d", x, y, w, h);
 
-    if (w > FSR1_Context::g_pendingWidth || h > FSR1_Context::g_pendingHeight) {
-        FSR1_Context::g_pendingWidth = w;
-        FSR1_Context::g_pendingHeight = h;
-        FSR1_Context::g_resolutionChanged = true;
+    if (fsrInitialized && FSR1_Context::g_renderFBO != 0 &&
+        gl_state->current_draw_fbo == FSR1_Context::g_renderFBO) {
+        // A viewport larger than the surface we know about is the earliest signal
+        // that the surface grew (rotation, window resize) -- EGL only confirms it
+        // at the next swap. Grow-only, so a deliberately small viewport cannot
+        // shrink the targets.
+        if (w > FSR1_Context::g_pendingWidth || h > FSR1_Context::g_pendingHeight) {
+            FSR1_Context::g_pendingWidth = w;
+            FSR1_Context::g_pendingHeight = h;
+            FSR1_Context::g_resolutionChanged = true;
+        }
+        GLES.glViewport(0, 0, FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight);
+        return;
     }
 
     GLES.glViewport(x, y, w, h);
+}
+
+void glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
+    if (fsrInitialized && FSR1_Context::g_renderFBO != 0 &&
+        gl_state->current_draw_fbo == FSR1_Context::g_renderFBO &&
+        (FSR1_Context::g_renderWidth != FSR1_Context::g_targetWidth ||
+         FSR1_Context::g_renderHeight != FSR1_Context::g_targetHeight)) {
+        // Surface pixels -> render pixels. GLdouble because GLsizei products
+        // overflow at 4K-plus surface sizes times large scissor values.
+        const GLdouble scaleX = static_cast<GLdouble>(FSR1_Context::g_renderWidth) / FSR1_Context::g_targetWidth;
+        const GLdouble scaleY = static_cast<GLdouble>(FSR1_Context::g_renderHeight) / FSR1_Context::g_targetHeight;
+        const GLint sx = static_cast<GLint>(x * scaleX);
+        const GLint sy = static_cast<GLint>(y * scaleY);
+        const GLsizei sw = static_cast<GLsizei>(width * scaleX);
+        const GLsizei sh = static_cast<GLsizei>(height * scaleY);
+        GLES.glScissor(sx, sy, sw, sh);
+        return;
+    }
+
+    GLES.glScissor(x, y, width, height);
 }
 
 // ---------------------------------------------------------------------------
@@ -544,11 +657,15 @@ namespace {
 
 struct fsr1_ctx_state_t {
     GLuint renderFBO = 0, renderTexture = 0, depthStencilRBO = 0;
-    GLuint quadVAO = 0, quadVBO = 0, fsrProgram = 0;
-    // Locations belong to fsrProgram, so they travel with it rather than being
-    // re-resolved after a context switch.
-    GLint inputTexLoc = -1, const0Loc = -1, viewportSizeLoc = -1;
-    GLuint targetFBO = 0, targetTexture = 0, currentDrawFBO = 0;
+    GLuint targetFBO = 0, targetTexture = 0;
+    GLuint quadVAO = 0, quadVBO = 0;
+    GLuint easuProgram = 0, rcasProgram = 0;
+    // Locations belong to the programs, so they travel with them rather than
+    // being re-resolved after a context switch.
+    GLint easuTexLoc = -1;
+    GLint easuConLoc[4] = {-1, -1, -1, -1};
+    GLint rcasTexLoc = -1;
+    GLint rcasConLoc = -1;
     GLsizei targetWidth = 0, targetHeight = 0, renderWidth = 0, renderHeight = 0;
     bool initialised = false;
 };
@@ -566,15 +683,16 @@ void store_into(fsr1_ctx_state_t& d) {
     d.renderFBO = FSR1_Context::g_renderFBO;
     d.renderTexture = FSR1_Context::g_renderTexture;
     d.depthStencilRBO = FSR1_Context::g_depthStencilRBO;
-    d.quadVAO = FSR1_Context::g_quadVAO;
-    d.quadVBO = FSR1_Context::g_quadVBO;
-    d.fsrProgram = FSR1_Context::g_fsrProgram;
-    d.inputTexLoc = FSR1_Context::g_inputTexLoc;
-    d.const0Loc = FSR1_Context::g_const0Loc;
-    d.viewportSizeLoc = FSR1_Context::g_viewportSizeLoc;
     d.targetFBO = FSR1_Context::g_targetFBO;
     d.targetTexture = FSR1_Context::g_targetTexture;
-    d.currentDrawFBO = FSR1_Context::g_currentDrawFBO;
+    d.quadVAO = FSR1_Context::g_quadVAO;
+    d.quadVBO = FSR1_Context::g_quadVBO;
+    d.easuProgram = FSR1_Context::g_easuProgram;
+    d.rcasProgram = FSR1_Context::g_rcasProgram;
+    d.easuTexLoc = FSR1_Context::g_easuTexLoc;
+    for (int i = 0; i < 4; ++i) d.easuConLoc[i] = FSR1_Context::g_easuConLoc[i];
+    d.rcasTexLoc = FSR1_Context::g_rcasTexLoc;
+    d.rcasConLoc = FSR1_Context::g_rcasConLoc;
     d.targetWidth = FSR1_Context::g_targetWidth;
     d.targetHeight = FSR1_Context::g_targetHeight;
     d.renderWidth = FSR1_Context::g_renderWidth;
@@ -586,15 +704,16 @@ void load_from(const fsr1_ctx_state_t& s) {
     FSR1_Context::g_renderFBO = s.renderFBO;
     FSR1_Context::g_renderTexture = s.renderTexture;
     FSR1_Context::g_depthStencilRBO = s.depthStencilRBO;
-    FSR1_Context::g_quadVAO = s.quadVAO;
-    FSR1_Context::g_quadVBO = s.quadVBO;
-    FSR1_Context::g_fsrProgram = s.fsrProgram;
-    FSR1_Context::g_inputTexLoc = s.inputTexLoc;
-    FSR1_Context::g_const0Loc = s.const0Loc;
-    FSR1_Context::g_viewportSizeLoc = s.viewportSizeLoc;
     FSR1_Context::g_targetFBO = s.targetFBO;
     FSR1_Context::g_targetTexture = s.targetTexture;
-    FSR1_Context::g_currentDrawFBO = s.currentDrawFBO;
+    FSR1_Context::g_quadVAO = s.quadVAO;
+    FSR1_Context::g_quadVBO = s.quadVBO;
+    FSR1_Context::g_easuProgram = s.easuProgram;
+    FSR1_Context::g_rcasProgram = s.rcasProgram;
+    FSR1_Context::g_easuTexLoc = s.easuTexLoc;
+    for (int i = 0; i < 4; ++i) FSR1_Context::g_easuConLoc[i] = s.easuConLoc[i];
+    FSR1_Context::g_rcasTexLoc = s.rcasTexLoc;
+    FSR1_Context::g_rcasConLoc = s.rcasConLoc;
     FSR1_Context::g_targetWidth = s.targetWidth;
     FSR1_Context::g_targetHeight = s.targetHeight;
     FSR1_Context::g_renderWidth = s.renderWidth;

@@ -27,33 +27,57 @@
 #include "../mg.h"
 #include <GL/gl.h>
 
+// mg-3backends FSR1: Arm Accuracy Super Resolution (FFXM FSR1) on a two-pass
+// pipeline. The GPU shaders live in FSRShaderSource.h; these are the Arm CPU
+// headers, vendored so the pass constants are computed with the very same
+// ffxFsrPopulateEasuConstants()/FsrRcasCon() code the shader headers ship,
+// bit for bit. GPU sections of these headers are compiled out (FFXM_GPU undefined).
+namespace FFXM_CPU_NS {
+// The Arm headers expect the C runtime but do not include it themselves.
+#include <cstdint>
+#include <cmath>
+#define FFXM_CPU 1
+#include "../../include/ffxm/ffxm_common_types.h"
+#include "../../include/ffxm/ffxm_core_cpu.h"
+#include "../../include/ffxm/fsr1/ffxm_fsr1.h"
+#undef FFXM_CPU
+} // namespace FFXM_CPU_NS
+
 namespace FSR1_Context {
+    // The owned default-framebuffer redirect: what framebuffer 0 becomes while
+    // FSR1 is on. Sized to the RENDER resolution -- the app renders low, the two
+    // passes below bring the frame back up to the surface.
     extern GLuint g_renderFBO;
     extern GLuint g_renderTexture;
     extern GLuint g_depthStencilRBO;
-    extern GLuint g_quadVAO;
-    extern GLuint g_quadVBO;
-    extern GLuint g_fsrProgram;
-    // Uniform locations of g_fsrProgram, resolved when it is linked and valid for
-    // as long as it lives. -1 for a name the linker dropped, which glUniform*
-    // ignores.
-    extern GLint g_inputTexLoc;
-    extern GLint g_const0Loc;
-    extern GLint g_viewportSizeLoc;
 
+    // The EASU intermediate, sized to the SURFACE resolution: pass 1 upscales
+    // render -> intermediate, pass 2 sharpens intermediate -> real surface.
     extern GLuint g_targetFBO;
     extern GLuint g_targetTexture;
 
-    extern GLuint g_currentDrawFBO;
-    extern GLint g_viewport[4];
-    extern GLsizei g_targetWidth;
+    extern GLuint g_quadVAO;
+    extern GLuint g_quadVBO;
+
+    extern GLuint g_easuProgram;
+    extern GLuint g_rcasProgram;
+
+    // Uniform locations of the two programs, resolved when they are linked and
+    // valid for as long as they live. -1 for a name the linker dropped, which
+    // glUniform* ignores.
+    extern GLint g_easuTexLoc;     // "uInputTex" (EASU)
+    extern GLint g_easuConLoc[4];  // "uEasuCon0".."uEasuCon3"
+    extern GLint g_rcasTexLoc;     // "uInputTex" (RCAS)
+    extern GLint g_rcasConLoc;     // "uRcasCon"
+
+    extern GLsizei g_targetWidth;   // surface resolution the passes produce at
     extern GLsizei g_targetHeight;
-    extern GLsizei g_renderWidth;
+    extern GLsizei g_renderWidth;   // resolution the app renders at
     extern GLsizei g_renderHeight;
     extern bool g_dirty;
 
-    extern bool g_resolutionChanged;
-    extern GLsizei g_pendingWidth;
+    extern bool g_resolutionChanged;      // a new size is waiting to be applied
+    extern GLsizei g_pendingWidth;        // pending SURFACE size
     extern GLsizei g_pendingHeight;
 } // namespace FSR1_Context
 
@@ -75,4 +99,5 @@ void OnResize(int width, int height);
 extern "C"
 {
     GLAPI void glViewport(GLint x, GLint y, GLsizei w, GLsizei h);
+    GLAPI void glScissor(GLint x, GLint y, GLsizei w, GLsizei h);
 }
