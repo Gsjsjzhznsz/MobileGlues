@@ -462,7 +462,16 @@ void InitFSRResources() {
     GLES.glUniform4uiv(FSR1_Context::g_rcasConLoc, 1, g_cachedRcasCon);
     GLES.glUseProgram(0);
 
-    GLES.glBindFramebuffer(GL_FRAMEBUFFER, FSR1_Context::g_renderFBO);
+    // Deliberately NO bind of the render FBO here. This runs from glCreateShader,
+    // mid-frame, with the application parked on whatever binding it chose; a raw
+    // bind would hijack that while the tracked draw binding still names the old
+    // target -- the driver and the tracker would diverge until the app's next
+    // glBindFramebuffer, drawing one frame into a target nobody agrees on. The
+    // redirect instead takes hold at the application's next bind of framebuffer
+    // 0, which is also the first moment the viewport rewrite has a tracked
+    // binding to consult.
+    LOG_W_FORCE("[MG] FSR1 ready: preset %d, sharpening %d%%, surface %dx%d", (int)global_settings.fsr1_setting,
+                global_settings.fsr1_sharpness, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight)
 }
 
 void RecreateRenderTargets() {

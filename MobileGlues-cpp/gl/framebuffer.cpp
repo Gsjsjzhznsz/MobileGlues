@@ -454,6 +454,43 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
                     srcX1 - srcX0, srcY1 - srcY0, dstX1 - dstX0, dstY1 - dstY0, mask,
                     (unsigned)read_fbo, read_status, (unsigned)draw_fbo, draw_status)
     }
+    // FSR1: the application addresses both blit endpoints in surface units, but
+    // under the redirect the endpoints are physically render-sized -- the draw
+    // binding of logical 0 resolves to g_renderFBO, and a read of logical 0 is
+    // redirected to it by the scope above. A transfer issued at surface size
+    // (MC's own targets are window-sized) would overrun the render target: the
+    // blit is clipped or rejected, the frame never lands, and every following
+    // upscale presents stale content -- reads as flicker. Scale each endpoint
+    // that is physically the redirect, exactly like the glScissor rewrite.
+    if (FSR1_Context::g_renderFBO != 0 &&
+        (FSR1_Context::g_renderWidth != FSR1_Context::g_targetWidth ||
+         FSR1_Context::g_renderHeight != FSR1_Context::g_targetHeight)) {
+        const bool scaleSrc = current_read_fbo == 0; /* logical default read */
+        const bool scaleDst = current_draw_fbo == FSR1_Context::g_renderFBO; /* logical default draw */
+        if (scaleSrc || scaleDst) {
+            const GLdouble scaleX = static_cast<GLdouble>(FSR1_Context::g_renderWidth) / FSR1_Context::g_targetWidth;
+            const GLdouble scaleY = static_cast<GLdouble>(FSR1_Context::g_renderHeight) / FSR1_Context::g_targetHeight;
+            if (scaleSrc) {
+                srcX0 = static_cast<GLint>(srcX0 * scaleX);
+                srcY0 = static_cast<GLint>(srcY0 * scaleY);
+                srcX1 = static_cast<GLint>(srcX1 * scaleX);
+                srcY1 = static_cast<GLint>(srcY1 * scaleY);
+            }
+            if (scaleDst) {
+                dstX0 = static_cast<GLint>(dstX0 * scaleX);
+                dstY0 = static_cast<GLint>(dstY0 * scaleY);
+                dstX1 = static_cast<GLint>(dstX1 * scaleX);
+                dstY1 = static_cast<GLint>(dstY1 * scaleY);
+            }
+            static int mg_fsr_blit_logged = 0;
+            if (mg_fsr_blit_logged < 2) {
+                mg_fsr_blit_logged++;
+                LOG_W_FORCE("[MG] fsr1 blit rewrite (src=%d dst=%d, scale %.3fx%.3f): -> %d,%d %dx%d draw %d,%d %dx%d",
+                            scaleSrc ? 1 : 0, scaleDst ? 1 : 0, scaleX, scaleY, srcX0, srcY0, srcX1 - srcX0,
+                            srcY1 - srcY0, dstX0, dstY0, dstX1 - dstX0, dstY1 - dstY0)
+            }
+        }
+    }
     GLES.glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
     if (mg_depth_blit_logged && (mask & GL_DEPTH_BUFFER_BIT)) {
         // Only ever fires once more: the flag now guards the error report, not
