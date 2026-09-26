@@ -183,6 +183,9 @@ namespace FSR1_Context {
     GLsizei g_targetHeight = 0;
     GLsizei g_renderWidth = 0;
     GLsizei g_renderHeight = 0;
+    // The app's window units on the redirect; see FSR1.h for the contract.
+    GLsizei g_viewWidth = 0;
+    GLsizei g_viewHeight = 0;
     bool g_dirty = false;
 
     bool g_resolutionChanged = false;
@@ -443,11 +446,17 @@ void InitFSRResources() {
 
     // Initial sizes. The first presented frame's CheckResolutionChange replaces
     // both with the real surface size before anything but test output has been
-    // drawn into them.
+    // drawn into them. The render size derives from the preset so the dummy
+    // pair is self-consistent (the old hardcoded 960x540 was the 1.3x pair
+    // regardless of what the user picked).
     FSR1_Context::g_targetWidth = 1280;
     FSR1_Context::g_targetHeight = 720;
-    FSR1_Context::g_renderWidth = 960;
-    FSR1_Context::g_renderHeight = 540;
+    CalculateRenderResolution(global_settings.fsr1_setting, FSR1_Context::g_targetWidth,
+                              FSR1_Context::g_targetHeight,
+                              reinterpret_cast<int*>(&FSR1_Context::g_renderWidth),
+                              reinterpret_cast<int*>(&FSR1_Context::g_renderHeight));
+    FSR1_Context::g_viewWidth = 0;
+    FSR1_Context::g_viewHeight = 0;
     CreateRenderSet();
     CreateIntermediate();
     RefreshFSRConstants();
@@ -586,12 +595,13 @@ void CheckResolutionChange(EGLDisplay display, EGLSurface surface) {
         surface = eglGetCurrentSurface(EGL_DRAW);
     }
     // Both queries stay, once a frame. EGL has no notification for a surface that
-    // changed size, and the only other trigger this file has -- the glViewport hook
-    // below -- only sees viewports the application issues on the redirect, so it
-    // can neither see a surface that shrank nor one the application never draws
-    // full-bleed into. They are also EGL calls, reading attributes the surface
-    // record already holds, not GL commands that have to reach the driver's
-    // command stream.
+    // changed size, and this query is the file's ONLY size trigger: the
+    // glViewport hook now only records the app's own window units (for the
+    // scissor/blit rewrites) and deliberately says nothing about the surface,
+    // so the query is what catches a surface that shrank as well as one the
+    // application never draws full-bleed into. They are also EGL calls,
+    // reading attributes the surface record already holds, not GL commands
+    // that have to reach the driver's command stream.
     egl_eglQuerySurface(display, surface, EGL_WIDTH, &width);
     egl_eglQuerySurface(display, surface, EGL_HEIGHT, &height);
     OnResize(width, height);
@@ -608,6 +618,11 @@ void CheckResolutionChange(EGLDisplay display, EGLSurface surface) {
         CalculateRenderResolution(global_settings.fsr1_setting, FSR1_Context::g_targetWidth,
                                   FSR1_Context::g_targetHeight, reinterpret_cast<int*>(&FSR1_Context::g_renderWidth),
                                   reinterpret_cast<int*>(&FSR1_Context::g_renderHeight));
+        // The window-units capture is tied to the old surface: after a rotation
+        // or a surface rebuild it must be re-learned from the app's next
+        // full-bleed viewport rather than kept stale.
+        FSR1_Context::g_viewWidth = 0;
+        FSR1_Context::g_viewHeight = 0;
         RecreateRenderTargets();
     }
     // No glViewport here. This runs immediately after ApplyFSR and the swap, and
@@ -645,16 +660,36 @@ void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
 
     if (fsrInitialized && FSR1_Context::g_renderFBO != 0 &&
         gl_state->current_draw_fbo == FSR1_Context::g_renderFBO) {
-        // A viewport larger than the surface we know about is the earliest signal
-        // that the surface grew (rotation, window resize) -- EGL only confirms it
-        // at the next swap. Grow-only, so a deliberately small viewport cannot
-        // shrink the targets.
-        if (w > FSR1_Context::g_pendingWidth || h > FSR1_Context::g_pendingHeight) {
-            FSR1_Context::g_pendingWidth = w;
-            FSR1_Context::g_pendingHeight = h;
-            FSR1_Context::g_resolutionChanged = true;
+        // The viewport the application issues on the redirect is in the app's
+        // own window units, not surface pixels: a launcher may size the EGL
+        // surface differently from the game's window (Minecraft on Zalith:
+        // window 2360x1080, surface 1920x1080). A full-bleed viewport is that
+        // window size -- remember the largest one seen, the scissor and blit
+        // rewrites need it as their scaling denominator. Scale the rectangle
+        // itself by the same ratio, so partial viewports keep their place in
+        // the frame (a full-bleed one reduces to the plain render-size rewrite
+        // this hook has always done).
+        //
+        // This is deliberately ALL this hook does about sizes. The old code
+        // also read a viewport wider than the surface as "the surface grew"
+        // and inflated the pending target -- but the game's window is
+        // PERMANENTLY larger than the surface in this pairing, so every frame
+        // flagged a resolution change that the next swap's surface query
+        // immediately pulled back: the target flip-flopped 1920 <-> 2360,
+        // RecreateRenderTargets ran once per frame wiping the render target,
+        // and the screen strobed. The surface query at the swap is the only
+        // size authority; the app's viewport says nothing about the surface.
+        if (x == 0 && y == 0 &&
+            (w > FSR1_Context::g_viewWidth || h > FSR1_Context::g_viewHeight)) {
+            FSR1_Context::g_viewWidth = w;
+            FSR1_Context::g_viewHeight = h;
         }
-        GLES.glViewport(0, 0, FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight);
+        const GLsizei unitW = FSR1_Context::g_viewWidth ? FSR1_Context::g_viewWidth : FSR1_Context::g_targetWidth;
+        const GLsizei unitH = FSR1_Context::g_viewHeight ? FSR1_Context::g_viewHeight : FSR1_Context::g_targetHeight;
+        const GLdouble scaleX = static_cast<GLdouble>(FSR1_Context::g_renderWidth) / unitW;
+        const GLdouble scaleY = static_cast<GLdouble>(FSR1_Context::g_renderHeight) / unitH;
+        GLES.glViewport(x ? static_cast<GLint>(x * scaleX) : 0, y ? static_cast<GLint>(y * scaleY) : 0,
+                        static_cast<GLsizei>(w * scaleX), static_cast<GLsizei>(h * scaleY));
         return;
     }
 
@@ -666,10 +701,14 @@ void glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
         gl_state->current_draw_fbo == FSR1_Context::g_renderFBO &&
         (FSR1_Context::g_renderWidth != FSR1_Context::g_targetWidth ||
          FSR1_Context::g_renderHeight != FSR1_Context::g_targetHeight)) {
-        // Surface pixels -> render pixels. GLdouble because GLsizei products
-        // overflow at 4K-plus surface sizes times large scissor values.
-        const GLdouble scaleX = static_cast<GLdouble>(FSR1_Context::g_renderWidth) / FSR1_Context::g_targetWidth;
-        const GLdouble scaleY = static_cast<GLdouble>(FSR1_Context::g_renderHeight) / FSR1_Context::g_targetHeight;
+        // Game-unit rectangles scale by the app's window size when that is
+        // known (it usually is: every frame opens with a full-bleed viewport
+        // on the redirect), and by the surface size otherwise. GLdouble
+        // because GLsizei products overflow at 4K-plus sizes.
+        const GLsizei unitW = FSR1_Context::g_viewWidth ? FSR1_Context::g_viewWidth : FSR1_Context::g_targetWidth;
+        const GLsizei unitH = FSR1_Context::g_viewHeight ? FSR1_Context::g_viewHeight : FSR1_Context::g_targetHeight;
+        const GLdouble scaleX = static_cast<GLdouble>(FSR1_Context::g_renderWidth) / unitW;
+        const GLdouble scaleY = static_cast<GLdouble>(FSR1_Context::g_renderHeight) / unitH;
         const GLint sx = static_cast<GLint>(x * scaleX);
         const GLint sy = static_cast<GLint>(y * scaleY);
         const GLsizei sw = static_cast<GLsizei>(width * scaleX);
@@ -697,6 +736,7 @@ struct fsr1_ctx_state_t {
     GLint rcasTexLoc = -1;
     GLint rcasConLoc = -1;
     GLsizei targetWidth = 0, targetHeight = 0, renderWidth = 0, renderHeight = 0;
+    GLsizei viewWidth = 0, viewHeight = 0;
     bool initialised = false;
 };
 
@@ -727,6 +767,8 @@ void store_into(fsr1_ctx_state_t& d) {
     d.targetHeight = FSR1_Context::g_targetHeight;
     d.renderWidth = FSR1_Context::g_renderWidth;
     d.renderHeight = FSR1_Context::g_renderHeight;
+    d.viewWidth = FSR1_Context::g_viewWidth;
+    d.viewHeight = FSR1_Context::g_viewHeight;
     d.initialised = fsrInitialized;
 }
 
@@ -748,6 +790,8 @@ void load_from(const fsr1_ctx_state_t& s) {
     FSR1_Context::g_targetHeight = s.targetHeight;
     FSR1_Context::g_renderWidth = s.renderWidth;
     FSR1_Context::g_renderHeight = s.renderHeight;
+    FSR1_Context::g_viewWidth = s.viewWidth;
+    FSR1_Context::g_viewHeight = s.viewHeight;
     fsrInitialized = s.initialised;
     // Left alone deliberately: g_dirty, g_resolutionChanged and the pending size
     // describe work queued for the frame in flight, not the context's objects.

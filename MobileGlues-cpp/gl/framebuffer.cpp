@@ -469,22 +469,35 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
                     srcX1 - srcX0, srcY1 - srcY0, dstX1 - dstX0, dstY1 - dstY0, mask,
                     (unsigned)read_fbo, read_status, (unsigned)draw_fbo, draw_status)
     }
-    // FSR1: the application addresses both blit endpoints in surface units, but
-    // under the redirect the endpoints are physically render-sized -- the draw
-    // binding of logical 0 resolves to g_renderFBO, and a read of logical 0 is
-    // redirected to it by the scope above. A transfer issued at surface size
-    // (MC's own targets are window-sized) would overrun the render target: the
-    // blit is clipped or rejected, the frame never lands, and every following
-    // upscale presents stale content -- reads as flicker. Scale each endpoint
-    // that is physically the redirect, exactly like the glScissor rewrite.
+    // FSR1: the application addresses blit endpoints aimed at the logical
+    // default framebuffer in its OWN window units, but under the redirect the
+    // endpoints are physically render-sized -- the draw binding of logical 0
+    // resolves to g_renderFBO, and a read of logical 0 is redirected to it by
+    // the scope above. A transfer issued at game-window size (MC's own targets
+    // are window-sized, 2360x1080 here, while the surface is launcher-sized
+    // 1920x1080) would overrun the render target: the blit is clipped or
+    // rejected, the frame never lands, and every following upscale presents
+    // stale content -- reads as flicker. Scale each endpoint that is
+    // physically the redirect by render / app-window, falling back to
+    // render / surface while nothing has been captured yet (see glViewport in
+    // FSR1.cpp for why the app's own units are the right denominator).
     if (FSR1_Context::g_renderFBO != 0 &&
         (FSR1_Context::g_renderWidth != FSR1_Context::g_targetWidth ||
          FSR1_Context::g_renderHeight != FSR1_Context::g_targetHeight)) {
         const bool scaleSrc = current_read_fbo == 0; /* logical default read */
         const bool scaleDst = current_draw_fbo == FSR1_Context::g_renderFBO; /* logical default draw */
         if (scaleSrc || scaleDst) {
-            const GLdouble scaleX = static_cast<GLdouble>(FSR1_Context::g_renderWidth) / FSR1_Context::g_targetWidth;
-            const GLdouble scaleY = static_cast<GLdouble>(FSR1_Context::g_renderHeight) / FSR1_Context::g_targetHeight;
+            // A full-bleed dst on the redirect is the app presenting its whole
+            // window: capture the window size in the app's own units, grown
+            // only so a partial present cannot shrink it.
+            if (scaleDst && dstX0 == 0 && dstY0 == 0) {
+                if (dstX1 > FSR1_Context::g_viewWidth) FSR1_Context::g_viewWidth = dstX1;
+                if (dstY1 > FSR1_Context::g_viewHeight) FSR1_Context::g_viewHeight = dstY1;
+            }
+            const GLsizei unitW = FSR1_Context::g_viewWidth ? FSR1_Context::g_viewWidth : FSR1_Context::g_targetWidth;
+            const GLsizei unitH = FSR1_Context::g_viewHeight ? FSR1_Context::g_viewHeight : FSR1_Context::g_targetHeight;
+            const GLdouble scaleX = static_cast<GLdouble>(FSR1_Context::g_renderWidth) / unitW;
+            const GLdouble scaleY = static_cast<GLdouble>(FSR1_Context::g_renderHeight) / unitH;
             if (scaleSrc) {
                 srcX0 = static_cast<GLint>(srcX0 * scaleX);
                 srcY0 = static_cast<GLint>(srcY0 * scaleY);

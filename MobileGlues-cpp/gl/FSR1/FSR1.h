@@ -74,6 +74,21 @@ namespace FSR1_Context {
     extern GLsizei g_targetHeight;
     extern GLsizei g_renderWidth;   // resolution the app renders at
     extern GLsizei g_renderHeight;
+
+    // The application's own window units on the redirect. A full-bleed viewport
+    // (or a full-bleed blit dst) issued on framebuffer 0 is the app's notion of
+    // its window, and it need not match the EGL surface: a launcher is free to
+    // size the surface differently from the game's window (Minecraft via
+    // Zalith: window 2360x1080, surface 1920x1080). The scissor and blit
+    // rewrites scale game-unit rectangles into render pixels, so their
+    // denominator has to be this, not the surface size. 0 = nothing captured
+    // yet; the rewrites then fall back to the surface sizes (the old
+    // behavior). Grown-only while a size is known; reset when the surface
+    // resolution changes, so a rotation re-learns the new window instead of
+    // keeping the stale one.
+    extern GLsizei g_viewWidth;
+    extern GLsizei g_viewHeight;
+
     extern bool g_dirty;
 
     extern bool g_resolutionChanged;      // a new size is waiting to be applied
