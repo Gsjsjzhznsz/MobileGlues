@@ -13,6 +13,7 @@
 #include <iostream>
 #include <fstream>
 #include <cstring>
+#include <cctype>
 #include "../log.h"
 #include "glslang/SPIRV/GlslangToSpv.h"
 #include <string>
@@ -263,6 +264,24 @@ std::string process_uniform_declarations(const std::string& glslCode) {
 
     while (scan_pos < length) {
         if (glslCode.compare(scan_pos, 7, "uniform") == 0) {
+            // Identifier-boundary checks. The keyword must stand alone: MC
+            // 26.3 RenderPearl renames every uniform to _uniform_%02d_%02d,
+            // so a bare substring match also hits inside ordinary references
+            // like "block._uniform_02_06 == 1". Matching there used to consume
+            // everything from the token to the next ';', gutting the enclosing
+            // if-header and leaving orphan 'else' tokens (Mali L0002/L0001).
+            const bool left_ok = (scan_pos == 0) ||
+                !(isalnum(static_cast<unsigned char>(glslCode[scan_pos - 1])) ||
+                  glslCode[scan_pos - 1] == '_');
+            const size_t after_keyword = scan_pos + 7;
+            const bool right_ok = (after_keyword >= length) ||
+                !(isalnum(static_cast<unsigned char>(glslCode[after_keyword])) ||
+                  glslCode[after_keyword] == '_');
+            if (!left_ok || !right_ok) {
+                ++scan_pos;
+                continue;
+            }
+
             if (scan_pos > chunk_start) {
                 result.append(glslCode, chunk_start, scan_pos - chunk_start);
             }
@@ -332,7 +351,38 @@ std::string process_uniform_declarations(const std::string& glslCode) {
                 decl_end = length;
             else
                 ++decl_end;
-            const bool has_initializer = (glslCode.find('=', scan_pos) < decl_end);
+
+            // Shape validation for the candidate span. A genuine uniform
+            // declaration (with or without an initializer) contains only
+            // identifiers, whitespace, '[', ']', ',', '=', ';' and balanced
+            // '()' pairs. Braces (interface-block bodies, if/for statements),
+            // member-access dots, or quotes mean this "uniform" hit is not a
+            // declaration keyword; the only safe outcome is to copy the span
+            // verbatim. Rewriting such a span used to delete arbitrary code
+            // up to the next ';' (the L0002/else corruption on MC 26.3).
+            bool decl_shaped = true;
+            {
+                int paren_depth = 0;
+                for (size_t p = decl_start; p < decl_end; ++p) {
+                    const char c = glslCode[p];
+                    if (c == '{' || c == '}' || c == '.' || c == '"' || c == '\'') {
+                        decl_shaped = false;
+                        break;
+                    }
+                    if (c == '(') {
+                        ++paren_depth;
+                    } else if (c == ')') {
+                        if (paren_depth == 0) {
+                            decl_shaped = false;
+                            break;
+                        }
+                        --paren_depth;
+                    }
+                }
+            }
+
+            const bool has_initializer =
+                decl_shaped && (glslCode.find('=', scan_pos) < decl_end);
             if (has_initializer) {
                 result.append("uniform").append(precision).append(" ").append(type).append(" ").append(name).append(
                     ";");
@@ -357,6 +407,185 @@ std::string processOutColorLocations(const std::string& glslCode) {
     const static std::regex pattern(R"(\n(out highp vec4 outColor)(\d+);)");
     const std::string replacement = "\nlayout(location=$2) $1$2;";
     return std::regex_replace(glslCode, pattern, replacement);
+}
+
+// ---------------------------------------------------------------------------
+// Fragment output-array unrolling (Mali S0015).
+//
+// MC 26.3's OIT transmittance shader declares `out vec4 coeff[4]` and fills it
+// from nested constant-bound loops (`coeff[attachmentIndex][i] = ...`). Desktop
+// GLSL lets every driver fold that; Mali's ESSL rejects ANY non-constant
+// integral index on an output array ("S0015: Outputs declared as arrays may
+// only be indexed by a constant integral expression"), which killed all core
+// pipelines. Unroll every constant-bound loop whose body writes such an array
+// so each surviving write carries literal subscripts. Loops that never touch
+// an output array are copied verbatim, so non-OIT shaders are untouched.
+namespace {
+
+struct OutputArrayDecl {
+    std::string name;
+};
+
+bool identifier_boundary(const std::string& s, size_t pos, size_t len) {
+    const bool left_ok = (pos == 0) ||
+        !(isalnum(static_cast<unsigned char>(s[pos - 1])) || s[pos - 1] == '_');
+    const size_t after = pos + len;
+    const bool right_ok = (after >= s.size()) ||
+        !(isalnum(static_cast<unsigned char>(s[after])) || s[after] == '_');
+    return left_ok && right_ok;
+}
+
+bool token_present(const std::string& text, const std::string& token) {
+    size_t pos = 0;
+    while ((pos = text.find(token, pos)) != std::string::npos) {
+        if (identifier_boundary(text, pos, token.size())) return true;
+        pos += 1;
+    }
+    return false;
+}
+
+void replace_token_inplace(std::string& text, const std::string& token, const std::string& repl) {
+    size_t pos = 0;
+    while ((pos = text.find(token, pos)) != std::string::npos) {
+        if (identifier_boundary(text, pos, token.size())) {
+            text.replace(pos, token.size(), repl);
+            pos += repl.size();
+        } else {
+            pos += token.size();
+        }
+    }
+}
+
+std::vector<OutputArrayDecl> collect_output_arrays(const std::string& essl) {
+    std::vector<OutputArrayDecl> arrays;
+    // `layout(location = N) out [flat] [highp] vec4 NAME[LITERAL]` — validate
+    // the shape and capture the name of every array-typed output.
+    static const std::regex name_pat(
+        R"(\bout\s+(?:flat\s+|centroid\s+|highp\s+|mediump\s+|lowp\s+)*(?:vec[234]|ivec[234]|uvec[234])\s+)"
+        R"(([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*(\d+)\s*\])");
+    for (auto it = std::sregex_iterator(essl.begin(), essl.end(), name_pat);
+         it != std::sregex_iterator(); ++it) {
+        OutputArrayDecl decl;
+        decl.name = (*it)[1].str();
+        arrays.push_back(decl);
+    }
+    return arrays;
+}
+
+struct ForHeaderInfo {
+    bool valid = false;
+    size_t header_end = 0; // position just past the closing ')'
+    std::string var;
+    long init = 0;
+    bool inclusive = false;
+    long bound = 0;
+};
+
+ForHeaderInfo parse_for_header(const std::string& s, size_t for_pos) {
+    ForHeaderInfo info;
+    static const std::regex pat(
+        R"(for\s*\(\s*int\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(-?\d+)\s*;\s*\1\s*(<=|<)\s*(\d+)\s*;\s*)"
+        R"((?:\+\+\s*\1|\1\s*\+\+)\s*\))");
+    const auto begin = s.cbegin() + static_cast<std::ptrdiff_t>(for_pos);
+    std::smatch m;
+    if (std::regex_search(begin, s.cend(), m, pat, std::regex_constants::match_continuous)) {
+        info.valid = true;
+        info.var = m[1].str();
+        info.init = atol(m[2].str().c_str());
+        info.inclusive = (m[3].str() == "<=");
+        info.bound = atol(m[4].str().c_str());
+        info.header_end = for_pos + static_cast<size_t>(m.length());
+    }
+    return info;
+}
+
+size_t find_matching_brace(const std::string& s, size_t open_pos) {
+    if (open_pos >= s.size() || s[open_pos] != '{') return std::string::npos;
+    int depth = 0;
+    for (size_t p = open_pos; p < s.size(); ++p) {
+        const char c = s[p];
+        if (c == '{') ++depth;
+        else if (c == '}') {
+            --depth;
+            if (depth == 0) return p;
+        }
+    }
+    return std::string::npos;
+}
+
+std::string unroll_output_array_loops_impl(const std::string& essl,
+                                           const std::vector<OutputArrayDecl>& arrays) {
+    const size_t length = essl.size();
+    std::string result;
+    result.reserve(length);
+
+    size_t pos = 0;
+    while (pos < length) {
+        size_t f = essl.find("for", pos);
+        while (f != std::string::npos && !identifier_boundary(essl, f, 3)) {
+            f = essl.find("for", f + 1);
+        }
+        if (f == std::string::npos) {
+            result.append(essl, pos, length - pos);
+            break;
+        }
+        result.append(essl, pos, f - pos);
+
+        const ForHeaderInfo header = parse_for_header(essl, f);
+        if (!header.valid) {
+            // Not the canonical constant-bound shape; copy the keyword and let
+            // normal scanning resume after it.
+            result.append(essl, f, 3);
+            pos = f + 3;
+            continue;
+        }
+
+        size_t body_open = header.header_end;
+        while (body_open < length && isspace(static_cast<unsigned char>(essl[body_open]))) ++body_open;
+        const size_t body_close =
+            (body_open < length && essl[body_open] == '{') ? find_matching_brace(essl, body_open)
+                                                           : std::string::npos;
+        if (body_close == std::string::npos) {
+            // Unbraced body (SPIRV-Cross always braces; be safe regardless).
+            result.append(essl, f, header.header_end - f);
+            pos = header.header_end;
+            continue;
+        }
+        const std::string body = essl.substr(body_open, body_close - body_open + 1);
+
+        long iterations = header.inclusive ? (header.bound - header.init + 1)
+                                           : (header.bound - header.init);
+        bool touches_output_array = false;
+        for (const auto& arr : arrays) {
+            if (body.find(arr.name + "[") != std::string::npos) {
+                touches_output_array = true;
+                break;
+            }
+        }
+        const bool has_jump = token_present(body, "break") || token_present(body, "continue");
+
+        if (!touches_output_array || has_jump || iterations <= 0 || iterations > 64) {
+            result.append(essl, f, body_close - f + 1);
+            pos = body_close + 1;
+            continue;
+        }
+
+        for (long i = header.init; i < header.init + iterations; ++i) {
+            std::string copy = body;
+            replace_token_inplace(copy, header.var, std::to_string(i));
+            result.append(unroll_output_array_loops_impl(copy, arrays));
+        }
+        pos = body_close + 1;
+    }
+    return result;
+}
+
+} // namespace
+
+std::string unroll_output_array_loops(const std::string& essl) {
+    const std::vector<OutputArrayDecl> arrays = collect_output_arrays(essl);
+    if (arrays.empty()) return essl;
+    return unroll_output_array_loops_impl(essl, arrays);
 }
 
 std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_version, uint glsl_version,
@@ -386,6 +615,12 @@ std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_vers
     std::string converted = GLSLtoGLSLES_2(glsl_code, glsl_type, essl_version, return_code);
     if (return_code >= 0 && !converted.empty()) {
         converted = process_uniform_declarations(converted);
+        if (glsl_type == GL_FRAGMENT_SHADER) {
+            // Mali rejects dynamic indices on output arrays (S0015); unroll
+            // the constant-bound loops that produce them before the ESSL is
+            // cached or handed to the driver.
+            converted = unroll_output_array_loops(converted);
+        }
         Cache::get_instance().put(sha256_string.c_str(), converted.c_str());
     }
 
