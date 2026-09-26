@@ -243,9 +243,9 @@ void RefreshFSRConstants() {
     FFXM_CPU_NS::FfxUInt32x4 con3 = {0, 0, 0, 0};
     FFXM_CPU_NS::ffxFsrPopulateEasuConstants(
         con0, con1, con2, con3,
-        static_cast<FfxFloat32>(FSR1_Context::g_renderWidth), static_cast<FfxFloat32>(FSR1_Context::g_renderHeight),
-        static_cast<FfxFloat32>(FSR1_Context::g_renderWidth), static_cast<FfxFloat32>(FSR1_Context::g_renderHeight),
-        static_cast<FfxFloat32>(FSR1_Context::g_targetWidth), static_cast<FfxFloat32>(FSR1_Context::g_targetHeight));
+        static_cast<float>(FSR1_Context::g_renderWidth), static_cast<float>(FSR1_Context::g_renderHeight),
+        static_cast<float>(FSR1_Context::g_renderWidth), static_cast<float>(FSR1_Context::g_renderHeight),
+        static_cast<float>(FSR1_Context::g_targetWidth), static_cast<float>(FSR1_Context::g_targetHeight));
     for (int i = 0; i < 4; ++i) {
         g_cachedEasuCon[0][i] = con0[i];
         g_cachedEasuCon[1][i] = con1[i];
