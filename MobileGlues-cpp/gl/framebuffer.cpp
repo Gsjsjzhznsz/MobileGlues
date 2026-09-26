@@ -186,6 +186,21 @@ void glBindFramebuffer(GLenum target, GLuint framebuffer) {
     if (framebuffer == 0 && target != GL_READ_FRAMEBUFFER) {
         draw_fb = FSR1_Context::g_renderFBO;
         FSR1_Context::g_dirty = true;
+        if (draw_fb != framebuffer) {
+            // One-shot: the first bind of framebuffer 0 that actually resolves to
+            // the redirect. This line is what grades "FSR1 on" in a log where
+            // LOG_D is compiled out: past it, the application's default
+            // framebuffer draws land in the render-sized target and the swap's
+            // two passes own the surface. If it never appears, the redirect never
+            // took hold and nothing downstream of it matters.
+            static bool mg_fsr_redirect_logged = false;
+            if (!mg_fsr_redirect_logged) {
+                mg_fsr_redirect_logged = true;
+                LOG_W_FORCE("[MG] FSR1 redirect active: framebuffer 0 -> render %dx%d (surface %dx%d)",
+                            FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight, FSR1_Context::g_targetWidth,
+                            FSR1_Context::g_targetHeight)
+            }
+        }
     }
 
     if (draw_fb != 0) {

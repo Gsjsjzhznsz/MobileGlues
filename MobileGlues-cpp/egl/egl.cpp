@@ -410,6 +410,19 @@ namespace {
         if (global_settings.fsr1_setting == FSR1_Quality_Preset::Disabled) {
             return egl_eglSwapBuffers(dpy, surface);
         }
+        // FSR1 objects are context-local, so init has to run on the context that
+        // presents. The glCreateShader trigger in gl/shader.cpp usually gets there
+        // first and lands on the render context; this lazy path covers the
+        // session where the first-shader context never presents -- without it the
+        // presenting context would keep an uninitialized state while ApplyFSR ran
+        // every swap with zero objects, parking the driver viewport at 0x0
+        // between frames (reads as a rapidly flickering screen with no upscale).
+        if (!fsrInitialized) InitFSRResources();
+        if (!fsrInitialized) {
+            // Init failed and self-disabled (fsr1_setting is now Disabled), so
+            // every later swap takes the raw passthrough above.
+            return egl_eglSwapBuffers(dpy, surface);
+        }
         ApplyFSR();
         const EGLBoolean result = egl_eglSwapBuffers(dpy, surface);
         CheckResolutionChange(dpy, surface);

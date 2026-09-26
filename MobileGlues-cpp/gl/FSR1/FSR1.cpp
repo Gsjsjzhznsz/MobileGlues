@@ -416,9 +416,16 @@ void InitFSRResources() {
     // cannot draw: the app would render into the redirect while nothing ever
     // presents it, which reads as a black screen. Tear the whole thing back down
     // instead -- no redirect, no FSR, the game renders exactly as it would with
-    // FSR1 disabled -- and let the log say why.
+    // FSR1 disabled -- and let the log say why. The self-disable is what makes
+    // that "exactly as it would": without it every later glCreateShader retried
+    // the whole init (fsrInitialized stayed false) and every swap kept running
+    // ApplyFSR on the zeroed state, parking the driver viewport at 0x0 between
+    // frames -- a rapidly flickering screen with no upscale, and no hint why,
+    // because LOG_F is invisible outside debug builds.
     if (FSR1_Context::g_easuProgram == 0 || FSR1_Context::g_rcasProgram == 0) {
-        LOG_F("FSR1 disabled: program compilation failed")
+        LOG_W_FORCE("[MG] FSR1 disabled: EASU/RCAS program compilation failed on this context -- FSR1 stays off for "
+                    "the whole session (no redirect, no upscale)")
+        global_settings.fsr1_setting = FSR1_Quality_Preset::Disabled;
         fsrInitialized = false;
         return;
     }
