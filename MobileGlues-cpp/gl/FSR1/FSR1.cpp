@@ -226,14 +226,27 @@ void CalculateRenderResolution(FSR1_Quality_Preset preset, int targetWidth, int 
 namespace {
 GLuint g_cachedEasuCon[4][4];
 GLuint g_cachedRcasCon[4];
- GLsizei g_cachedEasuInputW = 0, g_cachedEasuInputH = 0;
+// The launcher's sharpening slider (config key "fsr1Sharpness") is a 0-100
+// percentage, higher = sharper. RCAS wants sharpness stops, where each stop
+// halves the effect: the linear map below puts 100% at 0 stops (max
+// sharpening) and 0% at 2 stops (barely any). 90% -- the slider's default,
+// and what an absent config key resolves to in settings.cpp -- lands on 0.2
+// stops, exactly what this file was hardcoded to before the slider existed.
+GLfloat RcasSharpnessStops() {
+    int percent = global_settings.fsr1_sharpness;
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    return (100.0f - static_cast<float>(percent)) / 100.0f * 2.0f;
+}
+GLsizei g_cachedEasuInputW = 0, g_cachedEasuInputH = 0;
  GLsizei g_cachedEasuOutputW = 0, g_cachedEasuOutputH = 0;
-constexpr GLfloat kRcasSharpnessStops = 0.2f; // 0 = max sharpness, N = halve it N times
+float g_cachedSharpnessStops = -1.0f;
 
 void RefreshFSRConstants() {
+    const GLfloat rcasSharpnessStops = RcasSharpnessStops();
     if (FSR1_Context::g_renderWidth == g_cachedEasuInputW && FSR1_Context::g_renderHeight == g_cachedEasuInputH &&
         FSR1_Context::g_targetWidth == g_cachedEasuOutputW && FSR1_Context::g_targetHeight == g_cachedEasuOutputH &&
-        g_cachedEasuOutputW != 0) {
+        g_cachedEasuOutputW != 0 && g_cachedSharpnessStops == rcasSharpnessStops) {
         return;
     }
 
@@ -254,13 +267,14 @@ void RefreshFSRConstants() {
     }
 
     FFXM_CPU_NS::FfxUInt32x4 rcas = {0, 0, 0, 0};
-    FFXM_CPU_NS::FsrRcasCon(rcas, kRcasSharpnessStops);
+    FFXM_CPU_NS::FsrRcasCon(rcas, rcasSharpnessStops);
     for (int i = 0; i < 4; ++i) g_cachedRcasCon[i] = rcas[i];
 
     g_cachedEasuInputW = FSR1_Context::g_renderWidth;
     g_cachedEasuInputH = FSR1_Context::g_renderHeight;
     g_cachedEasuOutputW = FSR1_Context::g_targetWidth;
     g_cachedEasuOutputH = FSR1_Context::g_targetHeight;
+    g_cachedSharpnessStops = rcasSharpnessStops;
 }
 } // namespace
 

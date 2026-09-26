@@ -57,6 +57,15 @@ void init_settings() {
     int customGLVersionInt = success ? config_get_int("customGLVersion") : DEFAULT_GL_VERSION;
     FSR1_Quality_Preset fsr1Setting =
         success ? static_cast<FSR1_Quality_Preset>(config_get_int("fsr1Setting")) : FSR1_Quality_Preset::Disabled;
+    // FSR1 sharpening, 0-100 percentage, higher = sharper. config_get_int gives
+    // -1 for an absent key, and a hand-edited negative cannot be told apart
+    // from that, so any negative means "the config did not say": 90, the value
+    // that reproduces the 0.2 RCAS stops the renderer was hardcoded to before
+    // the launcher grew the slider. Above 100 clamps to 100. The launcher-side
+    // decode (MGConfigCodec / Fsr1Sharpness.fromDisk) follows these exact rules.
+    int fsr1Sharpness = success ? config_get_int("fsr1Sharpness") : 90;
+    if (fsr1Sharpness < 0) fsr1Sharpness = 90;
+    if (fsr1Sharpness > 100) fsr1Sharpness = 100;
     // mg-3backends: launcher-side FSR1 override. The unified plugin exposes
     // MOBILEGL_FSR1 as a per-game selectable so FSR does not depend on a
     // config.json the launcher may not manage; env > config.json > default.
@@ -234,6 +243,7 @@ void init_settings() {
     global_settings.angle_depth_clear_fix_mode = angleDepthClearFixMode;
     global_settings.custom_gl_version = customGLVersion;
     global_settings.fsr1_setting = fsr1Setting;
+    global_settings.fsr1_sharpness = fsr1Sharpness;
     global_settings.hide_mg_env_level = hideMGEnvLevel;
 #endif
 
@@ -258,6 +268,7 @@ void init_settings() {
               global_settings.custom_gl_version.toString().c_str());
     }
     LOG_V("[MobileGlues] Setting: fsr1Setting                 = %i", static_cast<int>(global_settings.fsr1_setting))
+    LOG_V("[MobileGlues] Setting: fsr1Sharpness               = %i", global_settings.fsr1_sharpness)
     LOG_V("[MobileGlues] Setting: hideMGEnvLevel              = %i",
           static_cast<int>(global_settings.hide_mg_env_level))
 
@@ -759,6 +770,8 @@ std::string dump_settings_string(std::string prefix) {
         break;
     }
     ss << "\n";
+
+    ss << prefix << "Fsr1Sharpness: " << global_settings.fsr1_sharpness << "/100\n";
 
     ss << prefix << "HideMGEnvLevel: "
        << ((global_settings.hide_mg_env_level == HideMGEnvLevel::Disabled)

@@ -214,6 +214,12 @@ struct global_settings_t {
     AngleDepthClearFixMode angle_depth_clear_fix_mode;
     Version custom_gl_version;
     FSR1_Quality_Preset fsr1_setting;
+    // FSR1 sharpening as a 0-100 percentage, higher = sharper. Written by the
+    // launcher as "fsr1Sharpness"; the RCAS pass converts it to sharpness stops
+    // with (100 - value) / 100 * 2, so 90 (the default, also used when the key
+    // is absent) reproduces the 0.2 stops the code was hardcoded to before the
+    // launcher grew the slider.
+    int fsr1_sharpness;
     HideMGEnvLevel hide_mg_env_level;
 };
 
