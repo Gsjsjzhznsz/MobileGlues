@@ -261,7 +261,31 @@
 // has no caller-image ambiguity, so this layer's exports win for every name
 // it implements, independent of image order and of who is calling. One-time
 // W_FORCE line reports the resolved own-image path for device-log verification.
-#define REVISION 16
+// REVISION 17: MC 26.3 core-pipeline conversion repair for GLES hosts.
+// RenderPearl pre-compiles every 26.3 core pipeline (shaderc -> SPIR-V ->
+// SPIRV-Cross) and hands this layer regenerated GLSL 330 whose uniforms and
+// fragment outputs are renamed to _uniform_%02d_%02d / _frag_output_%d.
+// Two converter defects surfaced with that input shape:
+// (1) process_uniform_declarations matched the 7-char "uniform" substring
+//     INSIDE identifiers such as ._uniform_02_06 and rewrote a member access
+//     into a fake uniform declaration, shredding the surrounding statements
+//     (Mali L0002 _uniform / param / param_2 cascade + L0001 "Typename
+//     expected, found 'else'"). The matcher now requires identifier
+//     boundaries (left/right neighbours outside [A-Za-z0-9_]) and validates
+//     the candidate span's shape (brace/paren/quote balance, no '.' or '{'
+//     inside) before any rewrite; anything else is copied verbatim.
+// (2) OIT accumulate/transmittance outputs are arrays indexed with runtime
+//     values (_frag_output_0[attachmentIndex][i]); ESSL 3.00 forbids dynamic
+//     indexing of out arrays (Mali S0015). unroll_output_array_loops() now
+//     constant-folds constant-bound for-loop indices over writes to declared
+//     out arrays on the fragment side; break/continue/non-canonical loops
+//     are left untouched, and shaders without out arrays are unaffected.
+// Verified offline with the mgharness full-chain reproducer (stageA
+// RenderPearl emulation + rename pass + GLSLtoGLSLES_2): every device-failing
+// 26.3 pipeline combination converts to glslang-ESSL-parseable output with
+// zero dynamic out-array subscripts. This cache-key-riding bump also discards
+// any ESSL cached by pre-17 builds on first run.
+#define REVISION 17
 #define PATCH 0
 
 #define VERSION_TYPE VERSION_RELEASE

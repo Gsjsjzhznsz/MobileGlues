@@ -1457,6 +1457,15 @@ static void GLSLtoGLSLES_2_entry(void* p) {
 }
 
 std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_version, int& return_code) {
+    // One-shot converter identity marker (thread-safe via magic static):
+    // device logs must be able to prove WHICH converter revision produced the
+    // ESSL they contain -- the 26.3 black-screen round-trip burned one test
+    // cycle on a log that could not answer that question.
+    static const bool rev_logged_ = [] {
+        LOG_W_FORCE("[MG] glsl_for_es converter rev " xstr(MAJOR) "." xstr(MINOR) "." xstr(REVISION) "." xstr(PATCH) " -- 26.3 fixes: uniform-decl boundary guard + OIT out-array unroll")
+        return true;
+    }();
+    (void)rev_logged_;
 #if defined(__APPLE__)
     std::string out;
     int rc = 0;
