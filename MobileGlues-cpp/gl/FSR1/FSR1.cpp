@@ -646,6 +646,19 @@ void CheckResolutionChange(EGLDisplay display, EGLSurface surface) {
         FSR1_Context::g_viewWidth = 0;
         FSR1_Context::g_viewHeight = 0;
         RecreateRenderTargets();
+
+        // Once-only visible telemetry: the ready/redirect lines printed at init
+        // time carry the hardcoded dummy pair, and every log analysis so far has
+        // had to reconstruct the REAL surface size indirectly from blit-rewrite
+        // scales. This line, after the derived render size is final, is the first
+        // trustworthy size statement in a log.
+        static bool mg_fsr_latch_logged = false;
+        if (!mg_fsr_latch_logged) {
+            mg_fsr_latch_logged = true;
+            LOG_W_FORCE("[MG] FSR1 surface latched: %dx%d -> render %dx%d",
+                        FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight,
+                        FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight)
+        }
     }
     // No glViewport here. This runs immediately after ApplyFSR and the swap, and
     // ApplyFSR ends every frame with exactly this call at exactly this size; on the

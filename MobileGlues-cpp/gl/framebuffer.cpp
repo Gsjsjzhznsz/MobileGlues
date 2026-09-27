@@ -513,8 +513,10 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
             static int mg_fsr_blit_logged = 0;
             if (mg_fsr_blit_logged < 2) {
                 mg_fsr_blit_logged++;
-                LOG_W_FORCE("[MG] fsr1 blit rewrite (src=%d dst=%d, scale %.3fx%.3f): -> %d,%d %dx%d draw %d,%d %dx%d",
-                            scaleSrc ? 1 : 0, scaleDst ? 1 : 0, scaleX, scaleY, srcX0, srcY0, srcX1 - srcX0,
+                LOG_W_FORCE("[MG] fsr1 blit rewrite (src=%d dst=%d, scale %.3fx%.3f, view %dx%d): -> %d,%d %dx%d draw %d,%d %dx%d",
+                            scaleSrc ? 1 : 0, scaleDst ? 1 : 0, scaleX, scaleY,
+                            FSR1_Context::g_viewWidth, FSR1_Context::g_viewHeight,
+                            srcX0, srcY0, srcX1 - srcX0,
                             srcY1 - srcY0, dstX0, dstY0, dstX1 - dstX0, dstY1 - dstY0)
             }
         }
