@@ -628,6 +628,29 @@ void CheckResolutionChange(EGLDisplay display, EGLSurface surface) {
     egl_eglQuerySurface(display, surface, EGL_HEIGHT, &height);
     OnResize(width, height);
 
+    // Strobe hunt (this round): a size the query hands out on alternating
+    // swaps -- two surfaces alive in one session, or one surface mid-rebuild
+    // -- is the known strobe source the pendingStreak debounce masks at the
+    // target level. The debounce keeps the targets stable but says nothing
+    // about WHY the query alternates. Log every identity change of the
+    // (surface, size) answer, rate-limited, so a device log shows the
+    // alternation, its period and the surface pointers directly.
+    {
+        static EGLSurface s_lastSurface = EGL_NO_SURFACE;
+        static GLsizei s_lastW = 0, s_lastH = 0;
+        static int s_identityChanges = 0;
+        if (surface != s_lastSurface || width != s_lastW || height != s_lastH) {
+            s_lastSurface = surface;
+            s_lastW = width;
+            s_lastH = height;
+            ++s_identityChanges;
+            if (s_identityChanges <= 24 || s_identityChanges % 128 == 0) {
+                LOG_W_FORCE("[MG] FSR1 surface identity #%d: surface %p now %dx%d", s_identityChanges,
+                            (void*)surface, width, height)
+            }
+        }
+    }
+
     if (FSR1_Context::g_resolutionChanged) {
         FSR1_Context::g_resolutionChanged = false;
         FSR1_Context::g_targetWidth = FSR1_Context::g_pendingWidth;
@@ -707,6 +730,47 @@ void OnResize(int width, int height) {
 // scissors), so they scale by the same ratio.
 // ---------------------------------------------------------------------------
 
+// Air Task 82 port. See FSR1.h for the contract; the shape test below is the
+// Amethyst fork's latch filter, adapted to this file's denominators (surface =
+// g_targetWidth/Height, latch = g_viewWidth/Height). Both latch sites -- the
+// glViewport hook below and the glBlitFramebuffer hook in framebuffer.cpp --
+// go through here, so one rejection log covers both.
+bool FSR1_WindowUnitsCandidate(GLsizei w, GLsizei h) {
+    if (w == 0 || h == 0) return false;
+    const double candidateAspect = static_cast<double>(w) / static_cast<double>(h);
+    auto aspectDrift = [](double a, double b) { return (a > b ? a - b : b - a) / b; };
+
+    // Rule 1, the window shape: the app's window is a uniform scale of the
+    // surface, so a window viewport carries the surface's aspect ratio. The
+    // 3% absorbs preset-scale rounding (1814/1262 = 1.4371 vs 2360/1640 =
+    // 1.4390, a 0.13% drift in the fork's own numbers).
+    if (FSR1_Context::g_targetWidth > 0 && FSR1_Context::g_targetHeight > 0 &&
+        aspectDrift(candidateAspect, static_cast<double>(FSR1_Context::g_targetWidth) /
+                                            static_cast<double>(FSR1_Context::g_targetHeight)) <= 0.03) {
+        return true;
+    }
+    // Rule 2, continuity: once units are known, only a candidate with the
+    // same shape may grow them. A real resize keeps the window's aspect;
+    // atlas (square) and shadow-map (square / fixed) passes do not.
+    if (FSR1_Context::g_viewWidth > 0 && FSR1_Context::g_viewHeight > 0 &&
+        aspectDrift(candidateAspect, static_cast<double>(FSR1_Context::g_viewWidth) /
+                                         static_cast<double>(FSR1_Context::g_viewHeight)) <= 0.03) {
+        return true;
+    }
+    // Once per distinct rejected size: the offending pass fires every frame,
+    // and the first refusal is the whole story.
+    static GLsizei s_rejectedW = -1, s_rejectedH = -1;
+    if (s_rejectedW != w || s_rejectedH != h) {
+        s_rejectedW = w;
+        s_rejectedH = h;
+        LOG_W_FORCE("[MG] FSR1 window-units latch rejected (air Task 82): %dx%d is not a window viewport "
+                    "(surface %dx%d, latch %dx%d) -- intermediate render pass kept out of the upscale geometry",
+                    w, h, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight, FSR1_Context::g_viewWidth,
+                    FSR1_Context::g_viewHeight)
+    }
+    return false;
+}
+
 void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
     LOG()
     LOG_D("glViewport: x=%d, y=%d, w=%d, h=%d", x, y, w, h);
@@ -733,7 +797,11 @@ void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
         // and the screen strobed. The surface query at the swap is the only
         // size authority; the app's viewport says nothing about the surface.
         if (x == 0 && y == 0 &&
-            (w > FSR1_Context::g_viewWidth || h > FSR1_Context::g_viewHeight)) {
+            (w > FSR1_Context::g_viewWidth || h > FSR1_Context::g_viewHeight) &&
+            // Air Task 82: growth alone is not enough -- a square atlas
+            // viewport grows the height past the window and poisons every
+            // rewrite from that frame on. Window-shaped candidates only.
+            FSR1_WindowUnitsCandidate(w, h)) {
             FSR1_Context::g_viewWidth = w;
             FSR1_Context::g_viewHeight = h;
         }

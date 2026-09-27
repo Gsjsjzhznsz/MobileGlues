@@ -489,8 +489,12 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
         if (scaleSrc || scaleDst) {
             // A full-bleed dst on the redirect is the app presenting its whole
             // window: capture the window size in the app's own units, grown
-            // only so a partial present cannot shrink it.
-            if (scaleDst && dstX0 == 0 && dstY0 == 0) {
+            // only so a partial present cannot shrink it. Air Task 82: growth
+            // alone is not enough -- a blit whose dst is an intermediate pass
+            // sized in its own units (square atlas, post chain) would poison
+            // the latch exactly like an oversized viewport; the same shape
+            // filter gates both sites.
+            if (scaleDst && dstX0 == 0 && dstY0 == 0 && FSR1_WindowUnitsCandidate(dstX1, dstY1)) {
                 if (dstX1 > FSR1_Context::g_viewWidth) FSR1_Context::g_viewWidth = dstX1;
                 if (dstY1 > FSR1_Context::g_viewHeight) FSR1_Context::g_viewHeight = dstY1;
             }

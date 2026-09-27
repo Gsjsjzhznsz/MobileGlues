@@ -117,6 +117,19 @@ void InitFSRResources();
 void CheckResolutionChange(EGLDisplay display, EGLSurface surface);
 void OnResize(int width, int height);
 
+// Air Task 82 port (Amethyst fork worklog: the "shrunk into the bottom-left
+// corner" root cause). The app-units latch above only ever grows, so any
+// full-bleed-looking candidate larger than the window in one axis poisons it
+// for good: MC 26.x runs intermediate passes whose viewport is a square
+// (2048x2048 atlas), and once such a candidate won, every rewrite used a
+// corrupt denominator and the upscale presented squashed / split / strobing
+// frames. A latch candidate has to be window-shaped: it carries the surface's
+// aspect ratio, or -- once units are known -- the latch's own aspect (a
+// genuine resize keeps the window shape; a rotation re-shapes the surface
+// first, so the new window re-matches the surface rule). Shared by the
+// glViewport latch here and the glBlitFramebuffer latch in framebuffer.cpp.
+bool FSR1_WindowUnitsCandidate(GLsizei w, GLsizei h);
+
 extern "C"
 {
     GLAPI void glViewport(GLint x, GLint y, GLsizei w, GLsizei h);

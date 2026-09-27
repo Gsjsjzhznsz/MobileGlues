@@ -423,6 +423,28 @@ namespace {
             // every later swap takes the raw passthrough above.
             return egl_eglSwapBuffers(dpy, surface);
         }
+        // Strobe hunt (this round): the ready line's "init #2" already showed
+        // a second context initializing FSR1 once. Two contexts presenting
+        // alternately -- each with its own render texture and latch state --
+        // is the remaining unproven strobe hypothesis: the presented content
+        // would alternate between two render targets frame by frame. Count
+        // every context identity change at the present point, rate-limited,
+        // so a device log proves or kills the hypothesis directly.
+        {
+            LOAD_EGL(eglGetCurrentContext)
+            if (egl_eglGetCurrentContext != nullptr) {
+                void* const current = egl_eglGetCurrentContext();
+                static void* s_lastPresentCtx = nullptr;
+                static int s_ctxSwitches = 0;
+                if (current != s_lastPresentCtx) {
+                    s_lastPresentCtx = current;
+                    ++s_ctxSwitches;
+                    if (s_ctxSwitches <= 12 || s_ctxSwitches % 256 == 0) {
+                        LOG_W_FORCE("[MG] FSR1 present context #%d: %p", s_ctxSwitches, current)
+                    }
+                }
+            }
+        }
         ApplyFSR();
         const EGLBoolean result = egl_eglSwapBuffers(dpy, surface);
         CheckResolutionChange(dpy, surface);
