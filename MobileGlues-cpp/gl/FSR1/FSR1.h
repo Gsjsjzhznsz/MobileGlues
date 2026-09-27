@@ -143,8 +143,14 @@ bool FSR1_ConsumePresentDirty();
 // frames. A latch candidate has to be window-shaped: it carries the surface's
 // aspect ratio, or -- once units are known -- the latch's own aspect (a
 // genuine resize keeps the window shape; a rotation re-shapes the surface
-// first, so the new window re-matches the surface rule). Shared by the
-// glViewport latch here and the glBlitFramebuffer latch in framebuffer.cpp.
+// first, so the new window re-matches the surface rule). Run 48f4b1c added
+// the empty-latch rule: with nothing latched yet there is nothing to protect,
+// so the first non-square full-bleed candidate SEEDS the latch -- refusing it
+// left the rewrites on surface denominators (surface 1280x720, window
+// 2360x1080 in that run) and the true window was rejected at startup.
+// Square candidates stay refused even empty: the atlas pass is square and
+// fires early. Shared by the glViewport latch here and the
+// glBlitFramebuffer latch in framebuffer.cpp.
 bool FSR1_WindowUnitsCandidate(GLsizei w, GLsizei h);
 
 extern "C"

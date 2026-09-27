@@ -765,6 +765,9 @@ std::string dump_settings_string(std::string prefix) {
     case FSR1_Quality_Preset::Performance:
         ss << "Performance";
         break;
+    case FSR1_Quality_Preset::Bypass:
+        ss << "Bypass(diagnostic)";
+        break;
     default:
         ss << "Unknown";
         break;

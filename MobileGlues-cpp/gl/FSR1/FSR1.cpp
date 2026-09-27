@@ -216,6 +216,7 @@ void CalculateRenderResolution(FSR1_Quality_Preset preset, int targetWidth, int 
         scale = 1.7f;
         break;
     case FSR1_Quality_Preset::Performance:
+    case FSR1_Quality_Preset::Bypass: // diagnostic: same geometry as Performance
         scale = 2.0f;
         break;
     default:
@@ -584,6 +585,24 @@ void ApplyFSR() {
     GLStateGuard state(GUARD_PROGRAM | GUARD_VAO | GUARD_TEXTURE | GUARD_FRAMEBUFFER | GUARD_ENABLES |
                        GUARD_COLOR_MASK);
 
+    // Diagnostic bypass (preset 5). The redirect, the units latch, the blit
+    // rewrites, the swap gate and the surface query all run exactly as with a
+    // real preset; the ONLY difference is what lands on the surface at the
+    // swap: a plain NEAREST stretch of the render target instead of the
+    // EASU+RCAS passes. A device that still strobes here convicts the layers
+    // at or below the redirect; a device that goes clean convicts the shader
+    // passes. Everything the guard covers (scissor, blend, bindings) is held
+    // off for the blit the same as for the passes.
+    if (global_settings.fsr1_setting == FSR1_Quality_Preset::Bypass) {
+        GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, FSR1_Context::g_renderFBO);
+        GLES.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        GLES.glBlitFramebuffer(0, 0, FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight, 0, 0,
+                               FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight, GL_COLOR_BUFFER_BIT,
+                               GL_NEAREST);
+        GLES.glViewport(0, 0, FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight);
+        return;
+    }
+
     RefreshFSRConstants();
 
     // ---- pass 1: EASU, render texture -> intermediate at surface size ----
@@ -754,6 +773,28 @@ bool FSR1_WindowUnitsCandidate(GLsizei w, GLsizei h) {
     if (w == 0 || h == 0) return false;
     const double candidateAspect = static_cast<double>(w) / static_cast<double>(h);
     auto aspectDrift = [](double a, double b) { return (a > b ? a - b : b - a) / b; };
+
+    // Run 48f4b1c rule, the empty latch. Both call sites only ever hand over a
+    // full-bleed candidate (origin 0,0 is checked by the caller), and when the
+    // latch is empty there is nothing the shape test could protect: refusing
+    // the first candidate left the rewrite denominators at the surface size,
+    // which is wrong for the entire FCL family (surface 1280x720 vs window
+    // 2360x1080 in that run) -- the log shows the true window REJECTED, the
+    // blit rewrite then drawing 1180x540 into the 640x360 render FBO. Seed the
+    // latch from the first non-square candidate instead. Square is still
+    // refused here: atlas passes are square and fire early, and they are the
+    // one shape the empty latch must never learn.
+    if (FSR1_Context::g_viewWidth == 0 && FSR1_Context::g_viewHeight == 0 && w != h) {
+        static GLsizei s_seededW = -1, s_seededH = -1;
+        if (s_seededW != w || s_seededH != h) {
+            s_seededW = w;
+            s_seededH = h;
+            LOG_W_FORCE("[MG] FSR1 window-units latch seeded: %dx%d (empty-latch rule, surface %dx%d; square "
+                        "intermediate passes stay refused)",
+                        w, h, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight)
+        }
+        return true;
+    }
 
     // Rule 1, the window shape: the app's window is a uniform scale of the
     // surface, so a window viewport carries the surface's aspect ratio. The

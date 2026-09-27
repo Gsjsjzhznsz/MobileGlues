@@ -181,7 +181,14 @@ typedef enum class FSR1_Quality_Preset : int { // may be useless
     Quality,      // 2
     Balanced,     // 3
     Performance,  // 4
-    MaxValue      // 5
+    // Diagnostic, not a quality preset: identical redirect, sizing (2x) and
+    // swap-gate machinery as Performance, but ApplyFSR presents the render
+    // target with a plain NEAREST blit instead of the EASU+RCAS passes.
+    // Run 48f4b1c proved the whole funnel state silent and stable through the
+    // strobe, so the remaining branch is "the two shader passes" vs
+    // "everything at or below the redirect": this preset is that experiment.
+    Bypass,       // 5
+    MaxValue      // 6
 };
 
 constexpr int MD_ENTRY_COUNT = static_cast<int>(md_entry_t::MaxValue);
