@@ -189,6 +189,13 @@ namespace FSR1_Context {
     GLsizei g_viewHeight = 0;
     bool g_dirty = false;
 
+    // The swap gate latch, per context (saved/restored by the state swap
+    // below). The game's context sets it every frame it renders; a second
+    // context that only presents never does, and its swap then skips the
+    // upscale instead of painting the surface with its untouched render
+    // target -- the empty-frame half of the alternating strobe.
+    bool g_presentDirty = false;
+
     bool g_resolutionChanged = false;
     GLsizei g_pendingWidth = 0;
     GLsizei g_pendingHeight = 0;
@@ -562,6 +569,14 @@ void RecreateRenderTargets() {
 
 std::vector<std::pair<GLsizei, GLsizei>> g_viewportStack;
 
+void FSR1_NoteRedirectDraw() { FSR1_Context::g_presentDirty = true; }
+
+bool FSR1_ConsumePresentDirty() {
+    const bool dirty = FSR1_Context::g_presentDirty;
+    FSR1_Context::g_presentDirty = false;
+    return dirty;
+}
+
 void ApplyFSR() {
     // No GUARD_ARRAY_BUFFER or GUARD_RENDERBUFFER: nothing below binds either.
     // GL_ARRAY_BUFFER_BINDING is context state and not vertex array object state, so
@@ -777,6 +792,11 @@ void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
 
     if (fsrInitialized && FSR1_Context::g_renderFBO != 0 &&
         gl_state->current_draw_fbo == FSR1_Context::g_renderFBO) {
+        // A viewport issued on the redirect is the app actively producing a
+        // frame there -- mark the swap gate, same as the bind-0 redirect and
+        // the rewritten blit dst. Without this site a game that binds
+        // framebuffer 0 once and renders many frames without rebinding would
+        // go gate-dark after the first consumed swap and present stale frames.
         // The viewport the application issues on the redirect is in the app's
         // own window units, not surface pixels: a launcher may size the EGL
         // surface differently from the game's window (Minecraft on Zalith:
@@ -805,6 +825,7 @@ void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
             FSR1_Context::g_viewWidth = w;
             FSR1_Context::g_viewHeight = h;
         }
+        FSR1_NoteRedirectDraw();
         const GLsizei unitW = FSR1_Context::g_viewWidth ? FSR1_Context::g_viewWidth : FSR1_Context::g_targetWidth;
         const GLsizei unitH = FSR1_Context::g_viewHeight ? FSR1_Context::g_viewHeight : FSR1_Context::g_targetHeight;
         const GLdouble scaleX = static_cast<GLdouble>(FSR1_Context::g_renderWidth) / unitW;
@@ -858,6 +879,7 @@ struct fsr1_ctx_state_t {
     GLint rcasConLoc = -1;
     GLsizei targetWidth = 0, targetHeight = 0, renderWidth = 0, renderHeight = 0;
     GLsizei viewWidth = 0, viewHeight = 0;
+    bool presentDirty = false;
     bool initialised = false;
 };
 
@@ -890,6 +912,7 @@ void store_into(fsr1_ctx_state_t& d) {
     d.renderHeight = FSR1_Context::g_renderHeight;
     d.viewWidth = FSR1_Context::g_viewWidth;
     d.viewHeight = FSR1_Context::g_viewHeight;
+    d.presentDirty = FSR1_Context::g_presentDirty;
     d.initialised = fsrInitialized;
 }
 
@@ -913,6 +936,7 @@ void load_from(const fsr1_ctx_state_t& s) {
     FSR1_Context::g_renderHeight = s.renderHeight;
     FSR1_Context::g_viewWidth = s.viewWidth;
     FSR1_Context::g_viewHeight = s.viewHeight;
+    FSR1_Context::g_presentDirty = s.presentDirty;
     fsrInitialized = s.initialised;
     // Left alone deliberately: g_dirty, g_resolutionChanged and the pending size
     // describe work queued for the frame in flight, not the context's objects.

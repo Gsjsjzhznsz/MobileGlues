@@ -410,26 +410,13 @@ namespace {
         if (global_settings.fsr1_setting == FSR1_Quality_Preset::Disabled) {
             return egl_eglSwapBuffers(dpy, surface);
         }
-        // FSR1 objects are context-local, so init has to run on the context that
-        // presents. The glCreateShader trigger in gl/shader.cpp usually gets there
-        // first and lands on the render context; this lazy path covers the
-        // session where the first-shader context never presents -- without it the
-        // presenting context would keep an uninitialized state while ApplyFSR ran
-        // every swap with zero objects, parking the driver viewport at 0x0
-        // between frames (reads as a rapidly flickering screen with no upscale).
-        if (!fsrInitialized) InitFSRResources();
-        if (!fsrInitialized) {
-            // Init failed and self-disabled (fsr1_setting is now Disabled), so
-            // every later swap takes the raw passthrough above.
-            return egl_eglSwapBuffers(dpy, surface);
-        }
-        // Strobe hunt (this round): the ready line's "init #2" already showed
-        // a second context initializing FSR1 once. Two contexts presenting
+        // Strobe hunt (carried over): the ready line's "init #3" showed three
+        // contexts initializing FSR1 in one session. Two contexts presenting
         // alternately -- each with its own render texture and latch state --
-        // is the remaining unproven strobe hypothesis: the presented content
-        // would alternate between two render targets frame by frame. Count
-        // every context identity change at the present point, rate-limited,
-        // so a device log proves or kills the hypothesis directly.
+        // paints the surface with two different render targets frame by frame.
+        // Count every context identity change at the present point, before the
+        // gate below so an alternation logs even when the swap is skipped,
+        // rate-limited, so a device log proves or kills the hypothesis directly.
         {
             LOAD_EGL(eglGetCurrentContext)
             if (egl_eglGetCurrentContext != nullptr) {
@@ -444,6 +431,45 @@ namespace {
                     }
                 }
             }
+        }
+        // The lazy init that used to run here is GONE, and its removal is the
+        // fix, not a cleanup. Initializing on first present drafted every
+        // bare presenter -- the SDL/TextureView bridge family, helper contexts,
+        // anything the host swaps from -- into full FSR participation: it got
+        // its own render target, its binds of 0 were redirected into it, and
+        // its next swap upscaled that target (which nobody renders into) over
+        // the whole surface. Alternating with the game's correct frames, that
+        // is the strobe; and the per-context state swap hid it from every
+        // size/identity telemetry, because nothing about the surface ever
+        // changed. FSR1 now initializes only where a pipeline is actually
+        // built: the glCreateShader trigger in gl/shader.cpp. A context that
+        // never compiles a shader presents raw, untouched, exactly as with FSR
+        // off.
+        if (!fsrInitialized) {
+            return egl_eglSwapBuffers(dpy, surface);
+        }
+        // The swap gate. Consume the per-context latch that the redirect bind,
+        // the rewritten blit dst and the on-redirect viewport all set: true
+        // means this context produced pixels for its render target since its
+        // last present, and the upscale has something real to read. False on a
+        // context that OWNS FSR objects but rendered nothing -- running the
+        // passes anyway is what put the empty target on the screen. This is
+        // also what makes the gate safe for the game itself: any frame it
+        // renders trips at least the viewport site, every frame, so a healthy
+        // single-context session never skips.
+        if (!FSR1_ConsumePresentDirty()) {
+            static int s_gateSkips = 0;
+            ++s_gateSkips;
+            if (s_gateSkips <= 24 || s_gateSkips % 256 == 0) {
+                LOAD_EGL(eglGetCurrentContext)
+                LOG_W_FORCE("[MG] FSR1 present skipped #%d: no draw into the redirect since the last present "
+                            "(ctx %p)",
+                            s_gateSkips,
+                            egl_eglGetCurrentContext ? (void*)egl_eglGetCurrentContext() : nullptr)
+            }
+            const EGLBoolean skipped = egl_eglSwapBuffers(dpy, surface);
+            CheckResolutionChange(dpy, surface);
+            return skipped;
         }
         ApplyFSR();
         const EGLBoolean result = egl_eglSwapBuffers(dpy, surface);

@@ -91,6 +91,15 @@ namespace FSR1_Context {
 
     extern bool g_dirty;
 
+    // "This context drew into its redirect since its last present." Set by the
+    // three sites that can put app pixels into the render target (the bind-0
+    // redirect, a rewritten blit dst, a viewport issued on the redirect),
+    // consumed by the swap gate in egl.cpp. Lives in the per-context state
+    // swap, so a second context that only presents -- and never renders --
+    // cannot ride the game's flag and have its empty render target upscaled
+    // over the surface (the strobe this gate exists to kill).
+    extern bool g_presentDirty;
+
     extern bool g_resolutionChanged;      // a new size is waiting to be applied
     extern GLsizei g_pendingWidth;        // pending SURFACE size
     extern GLsizei g_pendingHeight;
@@ -116,6 +125,14 @@ void ApplyFSR();
 void InitFSRResources();
 void CheckResolutionChange(EGLDisplay display, EGLSurface surface);
 void OnResize(int width, int height);
+
+// The swap gate. FSR1_NoteRedirectDraw() marks the CURRENT context's state as
+// having produced pixels for the redirect; FSR1_ConsumePresentDirty() reads and
+// clears it at the swap. egl.cpp runs ApplyFSR only on a consumed-true swap --
+// a context whose render target nobody rendered into since its last present
+// gets a raw passthrough instead of an upscale of stale content.
+void FSR1_NoteRedirectDraw();
+bool FSR1_ConsumePresentDirty();
 
 // Air Task 82 port (Amethyst fork worklog: the "shrunk into the bottom-left
 // corner" root cause). The app-units latch above only ever grows, so any

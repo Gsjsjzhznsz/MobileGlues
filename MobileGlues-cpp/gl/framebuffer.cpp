@@ -186,6 +186,9 @@ void glBindFramebuffer(GLenum target, GLuint framebuffer) {
     if (framebuffer == 0 && target != GL_READ_FRAMEBUFFER) {
         draw_fb = FSR1_Context::g_renderFBO;
         FSR1_Context::g_dirty = true;
+        // Swap gate: this context produced pixels for its redirect. See
+        // FSR1_ConsumePresentDirty() in egl.cpp for the consumer.
+        FSR1_NoteRedirectDraw();
         if (draw_fb != framebuffer) {
             // One-shot: the first bind of framebuffer 0 that actually resolves to
             // the redirect. This line is what grades "FSR1 on" in a log where
@@ -487,6 +490,9 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
         const bool scaleSrc = current_read_fbo == 0; /* logical default read */
         const bool scaleDst = current_draw_fbo == FSR1_Context::g_renderFBO; /* logical default draw */
         if (scaleSrc || scaleDst) {
+            // A rewritten dst is pixels landing in the redirect: mark the
+            // swap gate before the rectangles are touched.
+            if (scaleDst) FSR1_NoteRedirectDraw();
             // A full-bleed dst on the redirect is the app presenting its whole
             // window: capture the window size in the app's own units, grown
             // only so a partial present cannot shrink it. Air Task 82: growth
