@@ -20,6 +20,7 @@
 // upgrade is only worth what the plumbing around it is; the plumbing below is
 // what makes the presets real.
 #include "FSR1.h"
+#include <atomic>
 #include <cstdio>
 #include <mutex>
 #include <ska/flat_hash_map.hpp>
@@ -191,6 +192,7 @@ namespace FSR1_Context {
     bool g_resolutionChanged = false;
     GLsizei g_pendingWidth = 0;
     GLsizei g_pendingHeight = 0;
+    int g_pendingStreak = 0;
 } // namespace FSR1_Context
 
 void CalculateRenderResolution(FSR1_Quality_Preset preset, int targetWidth, int targetHeight, int* renderWidth,
@@ -486,11 +488,31 @@ void InitFSRResources() {
     // redirect instead takes hold at the application's next bind of framebuffer
     // 0, which is also the first moment the viewport rewrite has a tracked
     // binding to consult.
-    LOG_W_FORCE("[MG] FSR1 ready: preset %d, sharpening %d%%, surface %dx%d", (int)global_settings.fsr1_setting,
-                global_settings.fsr1_sharpness, FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight)
+    //
+    // Context identity rides the same line: every context here owns its own
+    // target pair, and a second init means a second live redirect -- if two
+    // contexts present alternately, their render textures alternate too, and
+    // that shows up in a device log as init #2 with no other explanation.
+    static std::atomic<int> initCount{0};
+    LOAD_EGL(eglGetCurrentContext)
+    LOG_W_FORCE("[MG] FSR1 ready: preset %d, sharpening %d%%, surface %dx%d (init #%d, ctx %p)",
+                (int)global_settings.fsr1_setting, global_settings.fsr1_sharpness, FSR1_Context::g_targetWidth,
+                FSR1_Context::g_targetHeight, ++initCount,
+                egl_eglGetCurrentContext ? (void*)egl_eglGetCurrentContext() : nullptr)
 }
 
 void RecreateRenderTargets() {
+    // Churn telemetry. Every hit is a real size transition; a handful per
+    // session is a rotation or a surface rebuild, but a counter racing through
+    // these lines is per-frame recreation -- the strobe signature -- and the
+    // count says so outright in a log where LOG_D does not exist.
+    static std::atomic<int> recreateCount{0};
+    const int recreation = ++recreateCount;
+    if (recreation <= 6 || recreation % 64 == 0) {
+        LOG_W_FORCE("[MG] FSR1 targets recreated #%d: render %dx%d, surface %dx%d", recreation,
+                    FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight, FSR1_Context::g_targetWidth,
+                    FSR1_Context::g_targetHeight)
+    }
     // No GUARD_PROGRAM, GUARD_VAO or GUARD_ARRAY_BUFFER: nothing below binds any of
     // the three. The programs are not recompiled here either, so the uniform
     // locations resolved at link time stay valid across a resolution change.
@@ -633,11 +655,29 @@ void CheckResolutionChange(EGLDisplay display, EGLSurface surface) {
 }
 
 void OnResize(int width, int height) {
-    if (FSR1_Context::g_targetWidth == width && FSR1_Context::g_targetHeight == height) return;
+    // Debounced. The device log that drove the previous strobing fix (run 26:
+    // two size regimes, 1280x720 and 2284x1080, alive in one session) showed a
+    // second way to reach per-frame RecreateRenderTargets: the surface query
+    // itself handing out two answers on alternating swaps -- two surfaces, or
+    // one mid-rebuild -- after the viewport trigger was already gone. A size
+    // seen once is not a resolution change; one the query repeats on the next
+    // swap is. A flip-flop never reaches two, so the targets freeze at their
+    // current size instead of being deleted and rebuilt every frame (which
+    // presents as a strobe and garbled blit landings); a real resize repeats
+    // by definition and lands one frame later than before.
+    if (FSR1_Context::g_targetWidth == width && FSR1_Context::g_targetHeight == height) {
+        FSR1_Context::g_pendingStreak = 0;
+        return;
+    }
 
-    FSR1_Context::g_pendingWidth = width;
-    FSR1_Context::g_pendingHeight = height;
-    FSR1_Context::g_resolutionChanged = true;
+    if (FSR1_Context::g_pendingWidth == width && FSR1_Context::g_pendingHeight == height) {
+        ++FSR1_Context::g_pendingStreak;
+    } else {
+        FSR1_Context::g_pendingWidth = width;
+        FSR1_Context::g_pendingHeight = height;
+        FSR1_Context::g_pendingStreak = 1;
+    }
+    if (FSR1_Context::g_pendingStreak >= 2) FSR1_Context::g_resolutionChanged = true;
 }
 
 // ---------------------------------------------------------------------------

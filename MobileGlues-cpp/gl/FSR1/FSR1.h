@@ -94,6 +94,12 @@ namespace FSR1_Context {
     extern bool g_resolutionChanged;      // a new size is waiting to be applied
     extern GLsizei g_pendingWidth;        // pending SURFACE size
     extern GLsizei g_pendingHeight;
+    // How many consecutive swaps have queried the pending size. The transition
+    // applies on the second one: a size the query hands out once is a surface
+    // mid-rebuild or a second answer in a flip-flop, not a resolution change
+    // (per-frame recreation of the targets is the strobe this file exists to
+    // avoid), while a real resize repeats every swap after it.
+    extern int g_pendingStreak;
 } // namespace FSR1_Context
 
 extern bool fsrInitialized;
