@@ -642,6 +642,24 @@ void ApplyFSR() {
     GLES.glBindTexture(GL_TEXTURE_2D, FSR1_Context::g_targetTexture);
     GLES.glDrawArrays(GL_TRIANGLES, 0, 6);
 
+    // Flush discipline (Task 8). FCL pokes swap interval 0 straight into the
+    // ANativeWindow (setNativeWindowSwapInterval, egl_bridge.c pojavInit), so
+    // the BufferQueue runs async and the flip no longer waits on the producer.
+    // The surface pass is the only writer of the visible buffer, and both
+    // present styles that write it -- this RCAS draw and the Bypass blit --
+    // strobe, while the untouched passthrough (preset 0) is clean. Submitting
+    // the pass before the swap closes the last ordering race the strobe can
+    // ride inside this funnel. Submission, not a drain: the Bypass preset keeps
+    // the full glFinish probe, so one more build separates "flush was enough"
+    // from "only a drain is" if the vsync-compat env injection (host side)
+    // has not already settled the question by removing the async forcing.
+    static bool s_flushDisciplineLogged = false;
+    if (!s_flushDisciplineLogged) {
+        s_flushDisciplineLogged = true;
+        LOG_W_FORCE("[MG] FSR1 flush discipline active: glFlush after surface pass (strobe hunt)")
+    }
+    GLES.glFlush();
+
     // The viewport and nothing else. Neither framebuffer binding is worth setting
     // here: the guard restores both on the next line, and what it restores for the
     // draw binding is the render framebuffer itself whenever the application was

@@ -579,6 +579,16 @@ extern "C"
         LOG_D("eglGetDisplay, display_id: %p", display_id);
         LOAD_EGL(eglGetDisplay)
         const EGLDisplay dpy = egl_eglGetDisplay(display_id);
+        // Bootstrap death-point telemetry (ZL2 hunt, Task 8): the host bridge's
+        // very first EGL call. Under ZalithLauncher the process can vanish
+        // silently -- jre_launcher routes SIGABRT into a clean System.exit -- so
+        // a crashed process only testifies through the checkpoints that survived
+        // in the lib's own latest.log. Every bridge entry point now leaves one.
+        static int s_getDisplays = 0;
+        if (++s_getDisplays <= 4 || s_getDisplays % 64 == 0) {
+            LOG_W_FORCE("[MG] bootstrap eglGetDisplay #%d: id %p -> %s", s_getDisplays, display_id,
+                        dpy == EGL_NO_DISPLAY ? "EGL_NO_DISPLAY" : "ok")
+        }
         ETRACE("eglGetDisplay(%p) -> %p", display_id, dpy);
         return dpy;
     }
@@ -587,6 +597,14 @@ extern "C"
         LOG_D("eglInitialize, dpy: %p, major: %p, minor: %p", dpy, major, minor);
         LOAD_EGL(eglInitialize)
         const EGLBoolean result = egl_eglInitialize(dpy, major, minor);
+        // Bootstrap telemetry (Task 8): #1 is the lib's own load-time probe, the
+        // host bridge's initialize is the next one -- the sequence itself says
+        // which stage a silent death stopped at.
+        static int s_initializes = 0;
+        if (++s_initializes <= 4 || s_initializes % 64 == 0) {
+            LOG_W_FORCE("[MG] bootstrap eglInitialize #%d: dpy %p -> %s", s_initializes, dpy,
+                        result == EGL_TRUE ? "ok" : "FAILED")
+        }
         if (result == EGL_TRUE) {
             ETRACE("eglInitialize(%p) -> EGL %d.%d", dpy, major ? *major : -1, minor ? *minor : -1);
             mg_display_initialised(dpy, false);
@@ -654,9 +672,21 @@ extern "C"
         std::vector<EGLint> backend_attributes;
         if (!makeBackendConfigAttributes(attrib_list, &backend_attributes)) {
             setFrontendError(EGL_BAD_ATTRIBUTE);
+            LOG_W_FORCE("[MG] bootstrap eglChooseConfig: attrib rewrite rejected the request")
             return EGL_FALSE;
         }
-        return egl_eglChooseConfig(dpy, backend_attributes.data(), configs, config_size, num_config);
+        const EGLBoolean result = egl_eglChooseConfig(dpy, backend_attributes.data(), configs, config_size,
+                                                      num_config);
+        // Bootstrap telemetry (Task 8): gl_init_context lives or dies by this
+        // answer -- num_config 0 is the quiet bridge-side failure that would
+        // otherwise only reach logcat through the host's own logger.
+        static int s_chooseConfigs = 0;
+        if (++s_chooseConfigs <= 4 || s_chooseConfigs % 64 == 0) {
+            LOG_W_FORCE("[MG] bootstrap eglChooseConfig #%d: dpy %p -> %s (num %d)", s_chooseConfigs, dpy,
+                        result == EGL_TRUE ? "ok" : "FAILED",
+                        (result == EGL_TRUE && num_config) ? *num_config : -1)
+        }
+        return result;
     }
 
     EGL_API EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute, EGLint* value) {
@@ -730,6 +760,14 @@ extern "C"
         const EGLBoolean result = egl_eglBindAPI(backend_api);
         ETRACE("eglBindAPI(%s) -> backend %s: %s", mg_egl_api_name(api), mg_egl_api_name(backend_api),
                result == EGL_TRUE ? "ok" : "FAILED");
+        // Bootstrap telemetry (Task 8): ZL2's gl_init_context calls this before
+        // its first eglCreateContext; a NULL-deref in the host's resolved pointer
+        // would die right here without any other trace.
+        static int s_bindApis = 0;
+        if (++s_bindApis <= 4 || s_bindApis % 64 == 0) {
+            LOG_W_FORCE("[MG] bootstrap eglBindAPI #%d: api %d -> %s", s_bindApis, (int)api,
+                        result == EGL_TRUE ? "ok" : "FAILED")
+        }
         if (result == EGL_TRUE) frontend_api = api;
         return result;
     }
@@ -802,6 +840,10 @@ extern "C"
               "attrib_list: %p",
               dpy, config, share_context, attrib_list);
         LOAD_EGL(eglCreateContext)
+        // Bootstrap telemetry (Task 8): one sequence for both context flavors.
+        static int s_contextCreations = 0;
+        const int ctxSeq = ++s_contextCreations;
+        const bool ctxLog = ctxSeq <= 4 || ctxSeq % 64 == 0;
         if (frontend_api != EGL_OPENGL_API) {
             // An ES context still gets a record. Without one g_current_ctx stays
             // null for the whole process on any host that never calls
@@ -812,6 +854,10 @@ extern "C"
             EGLContext es_context = egl_eglCreateContext(dpy, config, share_context, attrib_list);
             ETRACE("eglCreateContext(ES, dpy=%p, share=%p) -> %p [%s]", dpy, share_context, es_context,
                    describeAttributes(attrib_list).c_str());
+            if (ctxLog) {
+                LOG_W_FORCE("[MG] bootstrap eglCreateContext #%d (ES): dpy %p share %p -> %s", ctxSeq, dpy,
+                            share_context, es_context != EGL_NO_CONTEXT ? "ok" : "EGL_NO_CONTEXT")
+            }
             if (es_context != EGL_NO_CONTEXT) {
                 MGContext* record = mg_context_create(dpy, es_context, share_context, EGL_OPENGL_ES_API,
                                                       g_gles_caps.major, g_gles_caps.minor, 0, 0);
@@ -843,6 +889,10 @@ extern "C"
         EGLContext context = egl_eglCreateContext(dpy, config, share_context, backend_attributes.data());
         ETRACE("eglCreateContext(desktop, dpy=%p, share=%p) -> %p, granted %d.%d [backend attrs: %s]", dpy,
                share_context, context, frontend_major, frontend_minor, describeAttributes(backend_attributes).c_str());
+        if (ctxLog) {
+            LOG_W_FORCE("[MG] bootstrap eglCreateContext #%d (desktop): dpy %p share %p -> %s", ctxSeq, dpy,
+                        share_context, context != EGL_NO_CONTEXT ? "ok" : "EGL_NO_CONTEXT")
+        }
         if (context != EGL_NO_CONTEXT) {
             MGContext* record = mg_context_create(dpy, context, share_context, EGL_OPENGL_API, frontend_major,
                                                   frontend_minor, kVirtualDesktopProfileMask, frontend_flags);
