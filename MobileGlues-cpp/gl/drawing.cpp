@@ -210,11 +210,11 @@ void setupBufferTextureUniforms(GLuint program) {
     GLES.glUniform1i(info.locHeight, texObject->height);
 }
 
-void prepareForDraw(int api);
+mg_depth_draw_guard prepareForDraw(int api);
 
-void prepareForDraw() { prepareForDraw(0); }
+mg_depth_draw_guard prepareForDraw() { return prepareForDraw(0); }
 
-void prepareForDraw(int api) {
+mg_depth_draw_guard prepareForDraw(int api) {
     LOG_D("prepareForDraw...")
     if (hardware->emulate_texture_buffer) {
         setupBufferTextureUniforms(gl_state->current_program);
@@ -354,6 +354,11 @@ void prepareForDraw(int api) {
     // the dump so the first sight of a broken composite still logs the
     // application's raw state, then the force it received.
     mg_enforce_depth_sampling_nearest();
+
+    // Built here, destroyed where the drawing entry point returns: the
+    // guard spans every driver draw that entry point makes (multidraw
+    // loops included) and nothing else.
+    return mg_depth_draw_guard{};
 }
 
 
@@ -364,7 +369,7 @@ void prepareForDraw(int api) {
 void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     LOG()
     LOG_D("glDrawArrays, mode: %d, first: %d, count: %d", mode, first, count)
-    prepareForDraw(1);
+    auto depth_guard = prepareForDraw(1);
     GLES.glDrawArrays(mode, first, count);
     CHECK_GL_ERROR
 }
@@ -380,7 +385,7 @@ void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei inst
     LOG()
     LOG_D("glDrawArraysInstanced, mode: %d, first: %d, count: %d, instancecount: %d", mode, first, count,
           instancecount)
-    prepareForDraw(3);
+    auto depth_guard = prepareForDraw(3);
     GLES.glDrawArraysInstanced(mode, first, count, instancecount);
     CHECK_GL_ERROR
 }
@@ -404,7 +409,7 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void
     LOG()
     LOG_D("glDrawElementsInstanced, mode: %d, count: %d, type: %d, indices: %p, primcount: %d", mode, count, type,
           indices, primcount)
-    prepareForDraw();
+    auto depth_guard = prepareForDraw();
     if (mg_restart_needs_rewrite(type) && mg_draw_elements_restart(mode, count, type, indices, 0, primcount)) return;
     const bool restart_fixed = mg_restart_needs_driver_fixed(type);
     if (restart_fixed) GLES.glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
@@ -416,7 +421,7 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void
 void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
     LOG()
     LOG_D("glDrawElements, mode: %d, count: %d, type: %d, indices: %p", mode, count, type, indices)
-    prepareForDraw(2);
+    auto depth_guard = prepareForDraw(2);
     if (mg_restart_needs_rewrite(type) && mg_draw_elements_restart(mode, count, type, indices, 0, -1)) return;
     const bool restart_fixed = mg_restart_needs_driver_fixed(type);
     if (restart_fixed) GLES.glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
@@ -501,7 +506,7 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const voi
     LOG()
     LOG_D("glDrawElementsBaseVertex, mode: %d, count: %d, type: %d, indices: %p, basevertex: %d", mode, count, type,
           indices, basevertex);
-    prepareForDraw();
+    auto depth_guard = prepareForDraw();
     // The rewrite applies the base vertex itself, so it covers both the emulated
     // and the driver-supported branch below.
     if (mg_restart_needs_rewrite(type) && mg_draw_elements_restart(mode, count, type, indices, basevertex, -1)) return;
@@ -649,10 +654,31 @@ struct restart_guard_t {
 };
 } // namespace
 
+// glDrawArraysIndirect and glDrawElementsIndirect were NATIVE forwards
+// until the depth-completeness fix needed them on the prepareForDraw path
+// (glDrawArrays and glDrawArraysInstanced already are wrappers above). They
+// pick up the buffer-texture uniforms that path sets up as well, which every
+// other draw entry point already had.
+void glDrawArraysIndirect(GLenum mode, const void* indirect) {
+    LOG()
+    LOG_D("glDrawArraysIndirect, mode: %d, indirect: %p", mode, indirect)
+    auto depth_guard = prepareForDraw();
+    GLES.glDrawArraysIndirect(mode, indirect);
+    CHECK_GL_ERROR
+}
+
+void glDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
+    LOG()
+    LOG_D("glDrawElementsIndirect, mode: %d, type: %d, indirect: %p", mode, type, indirect)
+    auto depth_guard = prepareForDraw();
+    GLES.glDrawElementsIndirect(mode, type, indirect);
+    CHECK_GL_ERROR
+}
+
 void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices) {
     LOG()
     LOG_D("glDrawRangeElements, mode: %d, start: %u, end: %u, count: %d, type: %d", mode, start, end, count, type)
-    prepareForDraw();
+    auto depth_guard = prepareForDraw();
     // The rewritten stream is 32-bit with 0xFFFFFFFF sentinels, so start/end no
     // longer describe it. They are only a promise about the index range, and
     // dropping the promise is allowed; drawing the wrong primitives is not.
@@ -666,7 +692,7 @@ void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsize
                                    const void* indices, GLint basevertex) {
     LOG()
     LOG_D("glDrawRangeElementsBaseVertex, mode: %d, count: %d, type: %d, basevertex: %d", mode, count, type, basevertex)
-    prepareForDraw();
+    auto depth_guard = prepareForDraw();
     if (mg_restart_needs_rewrite(type) && mg_draw_elements_restart(mode, count, type, indices, basevertex, -1)) return;
     restart_guard_t guard(type);
     if (GLES.glDrawRangeElementsBaseVertex) {
@@ -684,7 +710,7 @@ void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, 
     LOG()
     LOG_D("glDrawElementsInstancedBaseVertex, mode: %d, count: %d, type: %d, instancecount: %d, basevertex: %d", mode,
           count, type, instancecount, basevertex)
-    prepareForDraw();
+    auto depth_guard = prepareForDraw();
     if (mg_restart_needs_rewrite(type) &&
         mg_draw_elements_restart(mode, count, type, indices, basevertex, instancecount))
         return;
@@ -724,7 +750,7 @@ void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, 
         DR_WARN_ONCE("glDrawArraysInstancedBaseInstance: baseinstance %u ignored, GLES has no base instance",
                      baseinstance);
     }
-    prepareForDraw(4);
+    auto depth_guard = prepareForDraw(4);
     GLES.glDrawArraysInstanced(mode, first, count, instancecount);
     CHECK_GL_ERROR
 }
