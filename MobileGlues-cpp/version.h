@@ -285,7 +285,21 @@
 // 26.3 pipeline combination converts to glslang-ESSL-parseable output with
 // zero dynamic out-array subscripts. This cache-key-riding bump also discards
 // any ESSL cached by pre-17 builds on first run.
-#define REVISION 17
+// REVISION 18: fork release line (maintainer yiqiu4178). Carries, on top of
+// upstream 2.0.17: the upstream issue #57 reply (PR #61) ported semantically
+// -- depth-family textures stay filter-complete under MIPMAP_LINEAR samplers
+// on strict ES hosts (depth_filter.h/.cpp predicates, mg_depth_draw_guard
+// draw-time pairing enforcement with force-aware and untracked-context
+// gates, glTexParameter* writing true records + legal driver views, sampler
+// shadow records with stale-force invalidation, glGetTexParameter*/glSampler
+// Parameter*iv/fv wrappers and ARB aliases); the FSR1 strobe-hunt machinery
+// (per-context redirect-dirty swap gate replacing present-time lazy init,
+// window-units latch shape filtering and empty-latch seeding, surface
+// identity and present-context telemetry, diagnostic preset 5 "Bypass" that
+// runs the full redirect machinery with a NEAREST blit present instead of
+// the EASU+RCAS passes). Cache-key-riding bump: every device discards ESSL
+// cached by pre-18 builds on first run.
+#define REVISION 18
 #define PATCH 0
 
 #define VERSION_TYPE VERSION_RELEASE
