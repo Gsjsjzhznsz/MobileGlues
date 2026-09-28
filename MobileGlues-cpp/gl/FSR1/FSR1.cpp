@@ -600,6 +600,18 @@ void ApplyFSR() {
                                FSR1_Context::g_targetWidth, FSR1_Context::g_targetHeight, GL_COLOR_BUFFER_BIT,
                                GL_NEAREST);
         GLES.glViewport(0, 0, FSR1_Context::g_renderWidth, FSR1_Context::g_renderHeight);
+        // Strobe probe (Task 7): the FCL Disabled session went clean, so the
+        // redirect machinery is convicted, and both present styles (the RCAS draw
+        // and this blit) strobe -- the remaining split is whether the buffer flip
+        // races the copy. A full pipeline drain here, in the diagnostic preset
+        // only: strobe gone => the fix is a flush discipline; strobe survives =>
+        // the layer below the flip owns it. One line marks the probe live.
+        static bool s_finishProbeLogged = false;
+        if (!s_finishProbeLogged) {
+            s_finishProbeLogged = true;
+            LOG_W_FORCE("[MG] FSR1 Bypass glFinish probe active (strobe hunt)")
+        }
+        GLES.glFinish();
         return;
     }
 

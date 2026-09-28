@@ -673,7 +673,27 @@ extern "C"
                                               const EGLint* attrib_list) {
         LOG_D("eglCreateWindowSurface, dpy: %p, config: %p, win: %p, attrib_list: %p", dpy, config, win, attrib_list);
         LOAD_EGL(eglCreateWindowSurface)
-        return egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
+        const EGLSurface result = egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
+        // Bootstrap death-point telemetry (ZL2 hunt, Task 7): under ZalithLauncher
+        // 2.6.1 the process goes silent after the lib's own init and before MC's
+        // first GL call -- exactly the window-surface/context bootstrap this hook
+        // family covers. One-shot W_FORCE lines: a crashed process still leaves
+        // every checkpoint it passed in latest.log, and the last line names the
+        // stage that died. The error query runs only on failure so a healthy
+        // creation never consumes the driver's error flag out from under the app.
+        static int s_windowSurfaceCreations = 0;
+        if (++s_windowSurfaceCreations <= 4 || s_windowSurfaceCreations % 64 == 0) {
+            if (result == EGL_NO_SURFACE) {
+                LOAD_EGL(eglGetError)
+                const EGLint err = egl_eglGetError ? egl_eglGetError() : 0;
+                LOG_W_FORCE("[MG] bootstrap eglCreateWindowSurface #%d: win %p -> EGL_NO_SURFACE (err 0x%x)",
+                            s_windowSurfaceCreations, win, err)
+            } else {
+                LOG_W_FORCE("[MG] bootstrap eglCreateWindowSurface #%d: win %p -> surface %p",
+                            s_windowSurfaceCreations, win, result)
+            }
+        }
+        return result;
     }
 
     EGL_API EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config, const EGLint* attrib_list) {
@@ -855,6 +875,14 @@ extern "C"
         const EGLBoolean result = egl_eglMakeCurrent(dpy, draw, read, ctx);
         ETRACE("eglMakeCurrent(dpy=%p, draw=%p, read=%p, ctx=%p, MGContext=%llu) -> %s", dpy, draw, read, ctx,
                before ? before->id : 0ULL, result == EGL_TRUE ? "ok" : "FAILED");
+        // Bootstrap death-point telemetry (ZL2 hunt, Task 7): same contract as the
+        // window-surface line -- the first four currentings log their verdict so a
+        // silently dying process names the stage it reached.
+        static int s_makeCurrents = 0;
+        if (++s_makeCurrents <= 4) {
+            LOG_W_FORCE("[MG] bootstrap eglMakeCurrent #%d: draw %p ctx %p -> %s", s_makeCurrents, draw, ctx,
+                        result == EGL_TRUE ? "ok" : "FAILED")
+        }
         // Only on success: a failed make-current leaves the previous context
         // current, so re-pointing the record would describe the wrong one.
         if (result == EGL_TRUE) mg_context_make_current(dpy, draw, read, ctx);

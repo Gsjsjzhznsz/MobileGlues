@@ -704,6 +704,11 @@ void init_settings_post() {
         }
         LOG_V("[MobileGlues] %-34s = %s", k_md_entries[i].order_key, order_str.c_str())
     }
+    // Bootstrap death-point telemetry (ZL2 hunt, Task 7): under ZalithLauncher
+    // 2.6.1 the process goes silent right after this dump, before MC's first GL
+    // call. This line is the last native-init checkpoint; in the next device log,
+    // whatever bootstrap line follows it names the stage that survived.
+    LOG_W_FORCE("[MG] native init complete (multidraw orders dumped)")
 }
 
 std::string dump_settings_string(std::string prefix) {
