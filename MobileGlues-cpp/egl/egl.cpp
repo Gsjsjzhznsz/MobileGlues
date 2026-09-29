@@ -448,6 +448,44 @@ namespace {
         if (!fsrInitialized) {
             return egl_eglSwapBuffers(dpy, surface);
         }
+        // Strobe hunt Task 9: buffer-age forensics. Everything above the flip
+        // is clean by telemetry, the state guard is verified in ApplyFSR, and
+        // the injected env reached the process, so the remaining candidates
+        // live at the flip itself. The signature of that whole family -- a
+        // buffer reaching the screen without having been fully drawn this
+        // frame -- is directly visible in EGL_BUFFER_AGE: a full-redraw
+        // pipeline pins it at 1, a freshly (re)allocated never-drawn buffer
+        // reads 0, and a producer that skipped a frame reads 2+. Queried once
+        // per present, before the passes run; anomalies log loud, the steady
+        // state only heartbeats. Runs ahead of the gate so the skip path is
+        // measured with the same instrument.
+        {
+            LOAD_EGL(eglQuerySurface)
+            if (egl_eglQuerySurface != nullptr) {
+#ifndef EGL_BUFFER_AGE_KHR
+#define EGL_BUFFER_AGE_KHR 0x313D
+#endif
+                EGLint bufferAge = -1;
+                if (egl_eglQuerySurface(dpy, surface, EGL_BUFFER_AGE_KHR, &bufferAge) == EGL_FALSE || bufferAge < 0) {
+                    static bool s_ageUnsupported = false;
+                    if (!s_ageUnsupported) {
+                        s_ageUnsupported = true;
+                        LOG_W_FORCE("[MG] FSR1 buffer-age: query unsupported by backend, forensics muted")
+                    }
+                } else {
+                    static int s_ageReads = 0;
+                    static int s_ageAnomalies = 0;
+                    ++s_ageReads;
+                    const bool ageAnomalous = bufferAge == 0 || bufferAge > 2;
+                    if (ageAnomalous) ++s_ageAnomalies;
+                    if (s_ageReads <= 12 || s_ageReads % 512 == 0 ||
+                        (ageAnomalous && (s_ageAnomalies <= 24 || s_ageAnomalies % 128 == 0))) {
+                        LOG_W_FORCE("[MG] FSR1 buffer-age #%d: age %d%s (surface %p)", s_ageReads, bufferAge,
+                                    ageAnomalous ? " ANOMALY" : "", (void*)surface)
+                    }
+                }
+            }
+        }
         // The swap gate. Consume the per-context latch that the redirect bind,
         // the rewritten blit dst and the on-redirect viewport all set: true
         // means this context produced pixels for its render target since its
@@ -830,8 +868,37 @@ extern "C"
 
     EGL_API EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval) {
         LOG_D("eglSwapInterval, dpy: %p, interval: %d", dpy, interval);
+        // Strobe hunt Task 9: deny the async flip at the EGL layer. The e9a2fc7
+        // session proved the injected env reached the process (Env: lines) and
+        // FCL's gating honours it, yet the strobe survived -- so every interval-0
+        // path that bypasses FCL's gl_swap_interval shim (LWJGL resolves EGL
+        // entry points itself and can call this directly) is the remaining way
+        // a producer could outrun the flip. With any FSR preset enabled the
+        // redirect owns the visible buffer, so an interval below 1 is refused
+        // outright; MOBILEGL_FSR1_VSYNC_CLAMP=0 restores the raw passthrough
+        // if a round ever needs to bisect this from the launcher side.
+        static int s_clampState = -1;
+        if (s_clampState < 0) {
+            const char* env = getenv("MOBILEGL_FSR1_VSYNC_CLAMP");
+            s_clampState = (env != nullptr && env[0] == '0') ? 0 : 1;
+        }
+        EGLint effective = interval;
+        if (s_clampState == 1 && global_settings.fsr1_setting != FSR1_Quality_Preset::Disabled && effective < 1) {
+            static int s_clamps = 0;
+            ++s_clamps;
+            if (s_clamps <= 8 || s_clamps % 256 == 0) {
+                LOG_W_FORCE("[MG] FSR1 vsync clamp #%d: eglSwapInterval(%d) -> 1 (async flip denied)", s_clamps,
+                            effective)
+            }
+            effective = 1;
+        }
+        static EGLint s_lastInterval = -1;
+        if (effective != s_lastInterval) {
+            s_lastInterval = effective;
+            LOG_W_FORCE("[MG] eglSwapInterval: interval now %d (requested %d, dpy %p)", effective, interval, dpy)
+        }
         LOAD_EGL(eglSwapInterval)
-        return egl_eglSwapInterval(dpy, interval);
+        return egl_eglSwapInterval(dpy, effective);
     }
 
     EGL_API EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context,
